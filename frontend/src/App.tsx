@@ -10,6 +10,7 @@ import {
   Timestamp,
 } from "firebase/firestore";
 import "./App.css";
+import SimulateCall from "./SimulateCall";
 
 type Conversation = {
   role: "user" | "assistant";
@@ -48,6 +49,7 @@ export default function App() {
   const [calls, setCalls] = useState<Array<{ id: string; data: CallDoc }>>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [tab, setTab] = useState<"logs" | "sim">("logs");
 
   useEffect(() => {
     if (!hasProjectId) return;
@@ -90,85 +92,100 @@ export default function App() {
         </div>
       </header>
 
-      <main className="main">
-        <section className="panel list">
-          <div className="panelHeader">
-            <div className="panelTitle">通話一覧</div>
-            <div className="panelMeta">{calls.length}件</div>
-          </div>
-          {error ? <div className="error">{error}</div> : null}
-          <div className="listBody">
-            {calls.map((c) => (
-              <button
-                key={c.id}
-                className={`row ${c.id === selectedId ? "active" : ""}`}
-                onClick={() => setSelectedId(c.id)}
-              >
-                <div className="rowTop">
-                  <span className="mono">{c.id}</span>
-                  <span className={`badge ${c.data.status || "unknown"}`}>{c.data.status || "unknown"}</span>
-                </div>
-                <div className="rowSub">
-                  <span className="muted">{c.data.from || "-"}</span>
-                  <span className="muted">→</span>
-                  <span className="muted">{c.data.to || "-"}</span>
-                </div>
-              </button>
-            ))}
-            {calls.length === 0 ? <div className="empty">まだ通話がありません</div> : null}
-          </div>
+      <div className="tabs">
+        <button className={`tab ${tab === "logs" ? "active" : ""}`} onClick={() => setTab("logs")}>
+          通話ログ
+        </button>
+        <button className={`tab ${tab === "sim" ? "active" : ""}`} onClick={() => setTab("sim")}>
+          疑似電話
+        </button>
+      </div>
+
+      {tab === "sim" ? (
+        <section className="panel">
+          <SimulateCall />
         </section>
-
-        <section className="panel detail">
-          <div className="panelHeader">
-            <div className="panelTitle">詳細</div>
-            <div className="panelMeta">{selected ? selected.id : "-"}</div>
-          </div>
-          {!selected ? (
-            <div className="empty">左から通話を選択してください</div>
-          ) : (
-            <div className="detailBody">
-              <div className="kv">
-                <div className="k">status</div>
-                <div className="v">{selected.data.status || "-"}</div>
-              </div>
-              <div className="kv">
-                <div className="k">from</div>
-                <div className="v mono">{selected.data.from || "-"}</div>
-              </div>
-              <div className="kv">
-                <div className="k">to</div>
-                <div className="v mono">{selected.data.to || "-"}</div>
-              </div>
-              <div className="kv">
-                <div className="k">purposeCaptured</div>
-                <div className="v">{selected.data.purposeCaptured ? "true" : "false"}</div>
-              </div>
-              {selected.data.purposeMessage ? (
-                <div className="kv">
-                  <div className="k">purposeMessage</div>
-                  <div className="v">{selected.data.purposeMessage}</div>
-                </div>
-              ) : null}
-
-              <div className="panelDivider" />
-
-              <div className="panelTitle">会話</div>
-              <div className="chat">
-                {(selected.data.conversations || []).map((m, idx) => (
-                  <div key={idx} className={`msg ${m.role}`}>
-                    <div className="msgRole">{m.role}</div>
-                    <div className="msgText">{m.content}</div>
-                  </div>
-                ))}
-                {(selected.data.conversations || []).length === 0 ? (
-                  <div className="empty">会話ログがまだありません</div>
-                ) : null}
-              </div>
+      ) : (
+        <main className="main">
+          <section className="panel list">
+            <div className="panelHeader">
+              <div className="panelTitle">通話一覧</div>
+              <div className="panelMeta">{calls.length}件</div>
             </div>
-          )}
-        </section>
-      </main>
+            {error ? <div className="error">{error}</div> : null}
+            <div className="listBody">
+              {calls.map((c) => (
+                <button
+                  key={c.id}
+                  className={`row ${c.id === selectedId ? "active" : ""}`}
+                  onClick={() => setSelectedId(c.id)}
+                >
+                  <div className="rowTop">
+                    <span className="mono">{c.id}</span>
+                    <span className={`badge ${c.data.status || "unknown"}`}>{c.data.status || "unknown"}</span>
+                  </div>
+                  <div className="rowSub">
+                    <span className="muted">{c.data.from || "-"}</span>
+                    <span className="muted">→</span>
+                    <span className="muted">{c.data.to || "-"}</span>
+                  </div>
+                </button>
+              ))}
+              {calls.length === 0 ? <div className="empty">まだ通話がありません</div> : null}
+            </div>
+          </section>
+
+          <section className="panel detail">
+            <div className="panelHeader">
+              <div className="panelTitle">詳細</div>
+              <div className="panelMeta">{selected ? selected.id : "-"}</div>
+            </div>
+            {!selected ? (
+              <div className="empty">左から通話を選択してください</div>
+            ) : (
+              <div className="detailBody">
+                <div className="kv">
+                  <div className="k">status</div>
+                  <div className="v">{selected.data.status || "-"}</div>
+                </div>
+                <div className="kv">
+                  <div className="k">from</div>
+                  <div className="v mono">{selected.data.from || "-"}</div>
+                </div>
+                <div className="kv">
+                  <div className="k">to</div>
+                  <div className="v mono">{selected.data.to || "-"}</div>
+                </div>
+                <div className="kv">
+                  <div className="k">purposeCaptured</div>
+                  <div className="v">{selected.data.purposeCaptured ? "true" : "false"}</div>
+                </div>
+                {selected.data.purposeMessage ? (
+                  <div className="kv">
+                    <div className="k">purposeMessage</div>
+                    <div className="v">{selected.data.purposeMessage}</div>
+                  </div>
+                ) : null}
+
+                <div className="panelDivider" />
+
+                <div className="panelTitle">会話</div>
+                <div className="chat">
+                  {(selected.data.conversations || []).map((m, idx) => (
+                    <div key={idx} className={`msg ${m.role}`}>
+                      <div className="msgRole">{m.role}</div>
+                      <div className="msgText">{m.content}</div>
+                    </div>
+                  ))}
+                  {(selected.data.conversations || []).length === 0 ? (
+                    <div className="empty">会話ログがまだありません</div>
+                  ) : null}
+                </div>
+              </div>
+            )}
+          </section>
+        </main>
+      )}
     </div>
   );
 }
