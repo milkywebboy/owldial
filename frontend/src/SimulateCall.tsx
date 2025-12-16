@@ -61,12 +61,10 @@ async function decodeAndResampleTo8kMono(file: File): Promise<Int16Array> {
   return pcm16;
 }
 
-type SimState =
-  | { kind: "idle" }
-  | { kind: "preparing"; msg: string }
-  | { kind: "running"; msg: string }
-  | { kind: "done"; msg: string }
-  | { kind: "error"; msg: string };
+type SimState = {
+  kind: "idle" | "preparing" | "running" | "done" | "error";
+  msg: string;
+};
 
 export default function SimulateCall() {
   const [wsUrl, setWsUrl] = useState("");
@@ -77,7 +75,7 @@ export default function SimulateCall() {
   const [chunkMs, setChunkMs] = useState(20);
   const [waitBeforeSpeakMs, setWaitBeforeSpeakMs] = useState(250);
   const [file, setFile] = useState<File | null>(null);
-  const [state, setState] = useState<SimState>({ kind: "idle" });
+  const [state, setState] = useState<SimState>({ kind: "idle", msg: "" });
 
   const [outboundBytes, setOutboundBytes] = useState(0);
   const [outboundChunks, setOutboundChunks] = useState(0);
