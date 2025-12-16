@@ -1,0 +1,12 @@
+# build artifacts
+build/
+
+# dependencies
+node_modules/
+
+# local env
+.env
+.env.*
+*.local
+
+
