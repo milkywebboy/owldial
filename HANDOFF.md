@@ -53,4 +53,24 @@ gcloud logging read \
 4. 必要なら環境変数変更:
    - `gcloud run services update media-stream --region us-central1 --project owldial --update-env-vars SILENCE_MS=500`
 
+## 疑似電話（テスト容易化）
+- **目的**: Twilioを使わずに、音声ファイルを「電話の発話」として `/streams` に流し込み、通話フロー（VAD→Whisper→返答TTS→WS送信）を再現する。
+- **場所**: `cloud-run-media-stream/simulate-call.js`
+- **要件**: ローカルに `ffmpeg` が必要
+
+例（ローカルで media-stream を起動している前提）:
+
+```bash
+cd cloud-run-media-stream
+npm run simulate-call -- --ws ws://localhost:8080/streams --in ./samples/user.wav --out ./out.ulaw --renderWav
+```
+
+例（Cloud Run を直接叩く）:
+
+```bash
+cd cloud-run-media-stream
+npm run simulate-call -- --ws wss://YOUR_CLOUD_RUN_DOMAIN/streams --in ./samples/user.wav --out ./out.ulaw --renderWav
+```
+
+
 
