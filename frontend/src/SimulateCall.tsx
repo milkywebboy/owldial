@@ -11,12 +11,16 @@ function randomId(prefix: string) {
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
-  // chunk to avoid callstack limits
+  // chunk to avoid callstack limits（ES5 targetでも動くようにスプレッドは使わない）
   let binary = "";
-  const chunk = 0x8000;
+  const chunk = 0x4000;
   for (let i = 0; i < bytes.length; i += chunk) {
     const sub = bytes.subarray(i, i + chunk);
-    binary += String.fromCharCode(...sub);
+    let part = "";
+    for (let j = 0; j < sub.length; j++) {
+      part += String.fromCharCode(sub[j]);
+    }
+    binary += part;
   }
   return btoa(binary);
 }
@@ -92,8 +96,8 @@ export default function SimulateCall() {
   }, [callSid]);
 
   useEffect(() => {
-    if (!wsUrl) setWsUrl(wsUrlAuto);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // wsUrl が未入力のときだけ自動補完（手入力を上書きしない）
+    setWsUrl((prev) => prev || wsUrlAuto);
   }, [wsUrlAuto]);
 
   useEffect(() => {
