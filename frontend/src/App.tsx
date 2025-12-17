@@ -11,6 +11,7 @@ import {
 } from "firebase/firestore";
 import "./App.css";
 import SimulateCall from "./SimulateCall";
+import { getFirebaseWebConfigFromEnvOrDefault } from "./firebaseConfig";
 
 type Conversation = {
   role: "user" | "assistant";
@@ -30,22 +31,8 @@ type CallDoc = {
   purposeMessage?: string;
 };
 
-function getFirebaseConfig() {
-  // CRA想定: REACT_APP_*
-  const cfg = {
-    apiKey: process.env.REACT_APP_FIREBASE_API_KEY,
-    authDomain: process.env.REACT_APP_FIREBASE_AUTH_DOMAIN,
-    projectId: process.env.REACT_APP_FIREBASE_PROJECT_ID,
-    storageBucket: process.env.REACT_APP_FIREBASE_STORAGE_BUCKET,
-    messagingSenderId: process.env.REACT_APP_FIREBASE_MESSAGING_SENDER_ID,
-    appId: process.env.REACT_APP_FIREBASE_APP_ID,
-  };
-  const hasProjectId = Boolean(cfg.projectId);
-  return { cfg, hasProjectId };
-}
-
 export default function App() {
-  const { cfg, hasProjectId } = useMemo(() => getFirebaseConfig(), []);
+  const { cfg, hasProjectId } = useMemo(() => getFirebaseWebConfigFromEnvOrDefault(), []);
   const [calls, setCalls] = useState<Array<{ id: string; data: CallDoc }>>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
