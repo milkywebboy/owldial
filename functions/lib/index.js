@@ -167,7 +167,7 @@ exports.testTTS = (0, https_1.onRequest)({
 exports.processCallEnd = (0, firestore_1.onDocumentUpdated)({
     document: "calls/{callId}",
     region: "us-central1",
-    secrets: ["OPENAI_API_KEY", "SLACK_BOT_TOKEN"],
+    secrets: ["OPENAI_API_KEY", "SLACK_BOT_TOKEN", "SLACK_CHANNEL_ID"],
 }, async (event) => {
     var _a, _b;
     const before = (_a = event.data) === null || _a === void 0 ? void 0 : _a.before.data();

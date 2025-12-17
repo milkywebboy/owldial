@@ -142,7 +142,7 @@ export const processCallEnd = onDocumentUpdated(
   {
     document: "calls/{callId}",
     region: "us-central1",
-    secrets: ["OPENAI_API_KEY", "SLACK_BOT_TOKEN"],
+    secrets: ["OPENAI_API_KEY", "SLACK_BOT_TOKEN", "SLACK_CHANNEL_ID"],
   },
   async (event) => {
     const before = event.data?.before.data();

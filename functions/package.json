@@ -17,7 +17,8 @@
     "firebase-functions": "^5.0.0",
     "openai": "^4.20.0",
     "@slack/web-api": "^7.0.0",
-    "twilio": "^4.19.0"
+    "twilio": "^4.19.0",
+    "@google-cloud/text-to-speech": "^5.0.0"
   },
   "devDependencies": {
     "typescript": "^5.0.0",
