@@ -929,13 +929,20 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     // Firestoreに会話を保存
     const callRef = db.collection("calls").doc(callSid);
     const tFs1 = Date.now();
-    await callRef.update({
-      conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
-        role: "user",
-        content: userMessage,
-        timestamp: Timestamp.now(),
-      }),
-    });
+    // 疑似電話（SIM_CALL_*）など、calls/{callSid} が無いケースでも落ちないように set(merge) を使う
+    await callRef.set(
+      {
+        callSid,
+        status: "active",
+        updatedAt: Timestamp.now(),
+        conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
+          role: "user",
+          content: userMessage,
+          timestamp: Timestamp.now(),
+        }),
+      },
+      { merge: true }
+    );
     console.log(`[LAT] firestore_user_update call=${callSid} dt=${Date.now() - tFs1}ms total=${Date.now() - t0}ms`);
 
     // AIによる意図分類で、対応不能な要望は伝言へ誘導する
@@ -946,13 +953,17 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       const farewell = "承知しました。失礼いたします。";
       console.log(`[FLOW] farewell call=${callSid}`);
       const tFs2 = Date.now();
-      await callRef.update({
-        conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
-          role: "assistant",
-          content: farewell,
-          timestamp: Timestamp.now(),
-        }),
-      });
+      await callRef.set(
+        {
+          updatedAt: Timestamp.now(),
+          conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
+            role: "assistant",
+            content: farewell,
+            timestamp: Timestamp.now(),
+          }),
+        },
+        { merge: true }
+      );
       console.log(`[LAT] firestore_assistant_update call=${callSid} dt=${Date.now() - tFs2}ms total=${Date.now() - t0}ms`);
       const tSend = Date.now();
       await sendAudioResponseViaMediaStream(session, farewell);
@@ -964,13 +975,17 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       const prompt = "恐れ入りますが担当者へお繋ぎできません。伝言として承りますので、ご用件と、お名前・折り返し先（電話番号）をお話しください。";
       console.log(`[FLOW] take_message call=${callSid}`);
       const tFs2 = Date.now();
-      await callRef.update({
-        conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
-          role: "assistant",
-          content: prompt,
-          timestamp: Timestamp.now(),
-        }),
-      });
+      await callRef.set(
+        {
+          updatedAt: Timestamp.now(),
+          conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
+            role: "assistant",
+            content: prompt,
+            timestamp: Timestamp.now(),
+          }),
+        },
+        { merge: true }
+      );
       console.log(`[LAT] firestore_assistant_update call=${callSid} dt=${Date.now() - tFs2}ms total=${Date.now() - t0}ms`);
       const tSend = Date.now();
       await sendAudioResponseViaMediaStream(session, prompt);
@@ -994,13 +1009,17 @@ async function processIncomingAudio(session, combinedAudioOverride) {
 
       const closing = `承知しました。${CLOSING_TEXT}`;
       const tFs2 = Date.now();
-      await callRef.update({
-        conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
-          role: "assistant",
-          content: closing,
-          timestamp: Timestamp.now(),
-        }),
-      });
+      await callRef.set(
+        {
+          updatedAt: Timestamp.now(),
+          conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
+            role: "assistant",
+            content: closing,
+            timestamp: Timestamp.now(),
+          }),
+        },
+        { merge: true }
+      );
       console.log(`[LAT] firestore_assistant_update call=${callSid} dt=${Date.now() - tFs2}ms total=${Date.now() - t0}ms`);
       const tSend = Date.now();
       await sendAudioResponseViaMediaStream(session, closing);
@@ -1013,13 +1032,17 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       const farewell = "承知しました。失礼いたします。";
       console.log(`[FLOW] no_more_requests_fallback call=${callSid}`);
       const tFs2 = Date.now();
-      await callRef.update({
-        conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
-          role: "assistant",
-          content: farewell,
-          timestamp: Timestamp.now(),
-        }),
-      });
+      await callRef.set(
+        {
+          updatedAt: Timestamp.now(),
+          conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
+            role: "assistant",
+            content: farewell,
+            timestamp: Timestamp.now(),
+          }),
+        },
+        { merge: true }
+      );
       console.log(`[LAT] firestore_assistant_update call=${callSid} dt=${Date.now() - tFs2}ms total=${Date.now() - t0}ms`);
       const tSend = Date.now();
       await sendAudioResponseViaMediaStream(session, farewell);
@@ -1062,13 +1085,17 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     
     // FirestoreにAI返答を保存
     const tFs2 = Date.now();
-    await callRef.update({
-      conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
-        role: "assistant",
-        content: aiResponse,
-        timestamp: Timestamp.now(),
-      }),
-    });
+    await callRef.set(
+      {
+        updatedAt: Timestamp.now(),
+        conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
+          role: "assistant",
+          content: aiResponse,
+          timestamp: Timestamp.now(),
+        }),
+      },
+      { merge: true }
+    );
     console.log(`[LAT] firestore_assistant_update call=${callSid} dt=${Date.now() - tFs2}ms total=${Date.now() - t0}ms`);
     
     // AI返答を音声で送信

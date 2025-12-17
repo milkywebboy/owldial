@@ -89,6 +89,10 @@ export default function SimulateCall() {
   const [sentChunks, setSentChunks] = useState(0);
   const [sentBytes, setSentBytes] = useState(0);
 
+  const [rtInterim, setRtInterim] = useState("");
+  const [rtFinal, setRtFinal] = useState<string[]>([]);
+  const recognitionRef = useRef<any>(null);
+
   const [outboundBytes, setOutboundBytes] = useState(0);
   const [outboundChunks, setOutboundChunks] = useState(0);
   const outboundMulawRef = useRef<Uint8Array[]>([]);
@@ -287,6 +291,7 @@ export default function SimulateCall() {
       setState({ kind: "preparing", msg: "WebSocket接続中…" });
       await connectWs();
       setState({ kind: "running", msg: "マイク送信中（ヘッドホン推奨）" });
+      startRealtimeRecognition();
 
       const src = captureCtx.createMediaStreamSource(stream);
       const proc = captureCtx.createScriptProcessor(4096, 1, 1);
@@ -339,6 +344,7 @@ export default function SimulateCall() {
   }
 
   async function stopMic() {
+    stopRealtimeRecognition();
     if (sendTimerRef.current) {
       window.clearInterval(sendTimerRef.current);
       sendTimerRef.current = null;
@@ -388,6 +394,66 @@ export default function SimulateCall() {
       setOutWavUrl(URL.createObjectURL(wavBlob));
       setOutMulawUrl(URL.createObjectURL(new Blob([merged], { type: "application/octet-stream" })));
     }
+  }
+
+  function startRealtimeRecognition() {
+    // Browser native speech recognition (Chrome/Edge). Best-effort.
+    try {
+      const SR: any = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (!SR) return;
+      const rec = new SR();
+      recognitionRef.current = rec;
+      rec.lang = "ja-JP";
+      rec.interimResults = true;
+      rec.continuous = true;
+      setRtInterim("");
+      setRtFinal([]);
+
+      rec.onresult = (event: any) => {
+        try {
+          let interim = "";
+          const finals: string[] = [];
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const r = event.results[i];
+            const txt = (r[0]?.transcript || "").trim();
+            if (!txt) continue;
+            if (r.isFinal) finals.push(txt);
+            else interim += (interim ? " " : "") + txt;
+          }
+          if (finals.length) setRtFinal((prev) => [...prev, ...finals].slice(-30));
+          setRtInterim(interim);
+        } catch {
+          // ignore
+        }
+      };
+      rec.onerror = () => {
+        // ignore（環境によっては頻繁に出る）
+      };
+      rec.onend = () => {
+        // continuousでも勝手に止まることがあるので、通話中なら再開
+        if (micEnabled) {
+          try {
+            rec.start();
+          } catch {
+            // ignore
+          }
+        }
+      };
+      rec.start();
+    } catch {
+      // ignore
+    }
+  }
+
+  function stopRealtimeRecognition() {
+    try {
+      const rec = recognitionRef.current;
+      recognitionRef.current = null;
+      if (rec) rec.stop();
+    } catch {
+      // ignore
+    }
+    setRtInterim("");
   }
 
   return (
@@ -492,6 +558,25 @@ export default function SimulateCall() {
           <div className="muted">sent chunks={sentChunks} / bytes={sentBytes}</div>
           <div className="muted">
             outbound chunks={outboundChunks} / bytes={outboundBytes}
+          </div>
+
+          <div className="panelDivider" />
+          <div className="panelTitle">リアルタイム文字起こし（ブラウザ）</div>
+          <div className="muted">※Chrome/Edgeで動作。AIに渡すWhisperとは別系統の“表示用”です。</div>
+          <div className="chat">
+            {rtFinal.map((t, idx) => (
+              <div key={idx} className="msg user">
+                <div className="msgRole">user (rt)</div>
+                <div className="msgText">{t}</div>
+              </div>
+            ))}
+            {rtInterim ? (
+              <div className="msg user">
+                <div className="msgRole">user (rt interim)</div>
+                <div className="msgText">{rtInterim}</div>
+              </div>
+            ) : null}
+            {!rtFinal.length && !rtInterim ? <div className="empty">まだありません</div> : null}
           </div>
           {outWavUrl ? (
             <div className="simAudio">
