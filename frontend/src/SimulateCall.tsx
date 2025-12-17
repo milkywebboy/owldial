@@ -61,12 +61,50 @@ async function decodeAndResampleTo8kMono(file: File): Promise<Int16Array> {
   return pcm16;
 }
 
+type ResampleState = {
+  buf: Float32Array;
+  pos: number;
+};
+
+function resampleTo8kLinear(input: Float32Array, inputRate: number, st: ResampleState): Int16Array {
+  const targetRate = 8000;
+  const ratio = inputRate / targetRate;
+
+  // concat leftover + new input
+  const prev = st.buf;
+  const buf = new Float32Array(prev.length + input.length);
+  buf.set(prev, 0);
+  buf.set(input, prev.length);
+
+  let pos = st.pos; // fractional index in buf
+  const out: number[] = [];
+
+  // Need at least 2 samples for interpolation
+  while (pos + 1 < buf.length) {
+    const idx = Math.floor(pos);
+    const frac = pos - idx;
+    const s0 = buf[idx];
+    const s1 = buf[idx + 1];
+    const v = s0 + (s1 - s0) * frac;
+    const clamped = Math.max(-1, Math.min(1, v));
+    out.push((clamped < 0 ? clamped * 32768 : clamped * 32767) | 0);
+    pos += ratio;
+  }
+
+  const keepFrom = Math.max(0, Math.floor(pos));
+  st.buf = buf.slice(keepFrom);
+  st.pos = pos - keepFrom;
+
+  return Int16Array.from(out);
+}
+
 type SimState = {
   kind: "idle" | "preparing" | "running" | "done" | "error";
   msg: string;
 };
 
 export default function SimulateCall() {
+  const [mode, setMode] = useState<"mic" | "file">("mic");
   const [wsUrl, setWsUrl] = useState("");
   const [callSid, setCallSid] = useState(() => randomId("SIM_CALL_"));
   const [streamSid, setStreamSid] = useState(() => randomId("SIM_STREAM_"));
@@ -77,11 +115,25 @@ export default function SimulateCall() {
   const [file, setFile] = useState<File | null>(null);
   const [state, setState] = useState<SimState>({ kind: "idle", msg: "" });
 
+  const [micEnabled, setMicEnabled] = useState(false);
+  const [sentChunks, setSentChunks] = useState(0);
+  const [sentBytes, setSentBytes] = useState(0);
+
   const [outboundBytes, setOutboundBytes] = useState(0);
   const [outboundChunks, setOutboundChunks] = useState(0);
   const outboundMulawRef = useRef<Uint8Array[]>([]);
   const [outWavUrl, setOutWavUrl] = useState<string | null>(null);
   const [outMulawUrl, setOutMulawUrl] = useState<string | null>(null);
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const captureCtxRef = useRef<AudioContext | null>(null);
+  const playbackCtxRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const procNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const sendTimerRef = useRef<number | null>(null);
+  const sendQueueRef = useRef<Uint8Array>(new Uint8Array(0));
+  const resampleRef = useRef<ResampleState>({ buf: new Float32Array(0), pos: 0 });
+  const playAtRef = useRef<number>(0);
 
   const wsUrlAuto = useMemo(() => {
     // フロントと同一ドメインでリバプロしている場合はこれで動く。違う場合は手入力でOK。
@@ -99,18 +151,146 @@ export default function SimulateCall() {
   }, [wsUrlAuto]);
 
   useEffect(() => {
+    // unmount cleanup: refs only（state更新はしない）
+    return () => {
+      try {
+        if (sendTimerRef.current) {
+          window.clearInterval(sendTimerRef.current);
+          sendTimerRef.current = null;
+        }
+        if (procNodeRef.current) {
+          try {
+            procNodeRef.current.disconnect();
+          } catch {
+            // ignore
+          }
+          procNodeRef.current.onaudioprocess = null;
+          procNodeRef.current = null;
+        }
+        if (micStreamRef.current) {
+          for (const t of micStreamRef.current.getTracks()) t.stop();
+          micStreamRef.current = null;
+        }
+        if (captureCtxRef.current) {
+          captureCtxRef.current.close().catch(() => {});
+          captureCtxRef.current = null;
+        }
+        if (wsRef.current) {
+          try {
+            wsRef.current.close();
+          } catch {
+            // ignore
+          }
+          wsRef.current = null;
+        }
+        if (playbackCtxRef.current) {
+          playbackCtxRef.current.close().catch(() => {});
+          playbackCtxRef.current = null;
+        }
+      } catch {
+        // ignore
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     return () => {
       if (outWavUrl) URL.revokeObjectURL(outWavUrl);
       if (outMulawUrl) URL.revokeObjectURL(outMulawUrl);
     };
   }, [outWavUrl, outMulawUrl]);
 
-  async function run() {
+  async function connectWs(): Promise<WebSocket> {
+    const url = new URL(wsUrl);
+    if (!url.searchParams.get("callSid")) url.searchParams.set("callSid", callSid);
+    const ws = new WebSocket(url.toString());
+    wsRef.current = ws;
+
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(String(ev.data || ""));
+        if (msg.event === "media" && msg.media?.payload) {
+          const track = msg.media?.track;
+          // サーバー送信（outbound）は通常 track がない想定。inbound はこちらが track=inbound で送る。
+          if (!track) {
+            const bytes = base64ToBytes(msg.media.payload);
+            outboundMulawRef.current.push(bytes);
+            setOutboundBytes((x) => x + bytes.length);
+            setOutboundChunks((x) => x + 1);
+            // リアルタイム再生
+            playOutboundMulaw(bytes);
+          }
+        } else if (msg.event === "mark") {
+          // ignore
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    await new Promise<void>((resolve, reject) => {
+      ws.onopen = () => resolve();
+      ws.onerror = () => reject(new Error("WebSocket接続に失敗しました"));
+    });
+
+    ws.send(JSON.stringify({ event: "connected" }));
+    ws.send(JSON.stringify({ event: "start", start: { streamSid, callSid, accountSid: "SIMULATED" } }));
+    return ws;
+  }
+
+  function appendToSendQueue(bytes: Uint8Array) {
+    const prev = sendQueueRef.current;
+    if (prev.length === 0) {
+      sendQueueRef.current = bytes;
+      return;
+    }
+    const merged = new Uint8Array(prev.length + bytes.length);
+    merged.set(prev, 0);
+    merged.set(bytes, prev.length);
+    sendQueueRef.current = merged;
+  }
+
+  function takeFromSendQueue(n: number): Uint8Array | null {
+    const q = sendQueueRef.current;
+    if (q.length < n) return null;
+    const head = q.subarray(0, n);
+    const rest = q.subarray(n);
+    sendQueueRef.current = rest.length ? new Uint8Array(rest) : new Uint8Array(0);
+    return new Uint8Array(head);
+  }
+
+  function ensurePlaybackCtx(): AudioContext {
+    if (playbackCtxRef.current) return playbackCtxRef.current;
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    playbackCtxRef.current = ctx;
+    playAtRef.current = 0;
+    return ctx;
+  }
+
+  function playOutboundMulaw(mulaw: Uint8Array) {
+    const ctx = ensurePlaybackCtx();
+    const pcm = muLawToPcm16(mulaw);
+    const buf = ctx.createBuffer(1, pcm.length, 8000);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < pcm.length; i++) ch[i] = Math.max(-1, Math.min(1, pcm[i] / 32768));
+
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    const now = ctx.currentTime;
+    const startAt = Math.max(playAtRef.current || now, now + 0.05);
+    src.start(startAt);
+    playAtRef.current = startAt + buf.duration;
+  }
+
+  async function runFile() {
     if (!file) {
       setState({ kind: "error", msg: "入力音声ファイルを選択してください" });
       return;
     }
     setState({ kind: "preparing", msg: "音声を8kHz/monoに変換中…" });
+    setSentBytes(0);
+    setSentChunks(0);
     setOutboundBytes(0);
     setOutboundChunks(0);
     outboundMulawRef.current = [];
@@ -125,43 +305,7 @@ export default function SimulateCall() {
     const totalSeconds = inboundMulaw.length / 8000;
 
     setState({ kind: "preparing", msg: `WS接続中…（inbound 約${totalSeconds.toFixed(2)}秒）` });
-
-    const url = new URL(wsUrl);
-    if (!url.searchParams.get("callSid")) url.searchParams.set("callSid", callSid);
-
-    const ws = new WebSocket(url.toString());
-
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(String(ev.data || ""));
-        if (msg.event === "media" && msg.media?.payload) {
-          const track = msg.media?.track;
-          // サーバー送信（outbound）は通常 track がない想定。inbound はこちらが track=inbound で送る。
-          if (!track) {
-            const bytes = base64ToBytes(msg.media.payload);
-            outboundMulawRef.current.push(bytes);
-            setOutboundBytes((x) => x + bytes.length);
-            setOutboundChunks((x) => x + 1);
-          }
-        }
-      } catch {
-        // ignore
-      }
-    };
-
-    await new Promise<void>((resolve, reject) => {
-      ws.onopen = () => resolve();
-      ws.onerror = () => reject(new Error("WebSocket接続に失敗しました"));
-    });
-
-    setState({ kind: "running", msg: "connected/start を送信…" });
-    ws.send(JSON.stringify({ event: "connected" }));
-    ws.send(
-      JSON.stringify({
-        event: "start",
-        start: { streamSid, callSid, accountSid: "SIMULATED" },
-      })
-    );
+    const ws = await connectWs();
 
     await sleep(waitBeforeSpeakMs);
 
@@ -179,6 +323,8 @@ export default function SimulateCall() {
           media: { payload: bytesToBase64(chunk), track: "inbound" },
         })
       );
+      setSentChunks((x) => x + 1);
+      setSentBytes((x) => x + chunk.length);
       if (i < totalChunks - 1) {
         await sleep(Math.max(0, Math.floor(chunkMs / pace)));
       }
@@ -204,15 +350,157 @@ export default function SimulateCall() {
     setState({ kind: "done", msg: "完了" });
   }
 
+  async function startMic() {
+    if (micEnabled) return;
+    setState({ kind: "preparing", msg: "マイク許可をリクエスト中…" });
+    setSentBytes(0);
+    setSentChunks(0);
+    setOutboundBytes(0);
+    setOutboundChunks(0);
+    outboundMulawRef.current = [];
+    sendQueueRef.current = new Uint8Array(0);
+    resampleRef.current = { buf: new Float32Array(0), pos: 0 };
+    playAtRef.current = 0;
+
+    if (outWavUrl) URL.revokeObjectURL(outWavUrl);
+    if (outMulawUrl) URL.revokeObjectURL(outMulawUrl);
+    setOutWavUrl(null);
+    setOutMulawUrl(null);
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      } as any,
+    });
+    micStreamRef.current = stream;
+
+    const captureCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    captureCtxRef.current = captureCtx;
+
+    // Playback context init (so first audio starts quickly)
+    ensurePlaybackCtx();
+
+    const ws = await connectWs();
+    setState({ kind: "running", msg: "マイク送信中（ヘッドホン推奨）" });
+
+    const src = captureCtx.createMediaStreamSource(stream);
+    const proc = captureCtx.createScriptProcessor(4096, 1, 1);
+    procNodeRef.current = proc;
+
+    proc.onaudioprocess = (ev) => {
+      try {
+        const input = ev.inputBuffer.getChannelData(0);
+        const pcm8k = resampleTo8kLinear(input, captureCtx.sampleRate, resampleRef.current);
+        if (!pcm8k.length) return;
+        const mulaw = pcm16ToMuLaw(pcm8k);
+        appendToSendQueue(mulaw);
+      } catch {
+        // ignore
+      }
+    };
+
+    src.connect(proc);
+    // Connect to destination with zero gain to keep node alive without audible feedback
+    const zero = captureCtx.createGain();
+    zero.gain.value = 0;
+    proc.connect(zero);
+    zero.connect(captureCtx.destination);
+
+    const tick = Math.max(5, chunkMs);
+    sendTimerRef.current = window.setInterval(() => {
+      try {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+        const chunk = takeFromSendQueue(chunkBytes);
+        if (!chunk) return;
+        ws.send(
+          JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: bytesToBase64(chunk), track: "inbound" },
+          })
+        );
+        setSentChunks((x) => x + 1);
+        setSentBytes((x) => x + chunk.length);
+      } catch {
+        // ignore
+      }
+    }, tick);
+
+    setMicEnabled(true);
+  }
+
+  async function stopMic() {
+    if (sendTimerRef.current) {
+      window.clearInterval(sendTimerRef.current);
+      sendTimerRef.current = null;
+    }
+    if (procNodeRef.current) {
+      try {
+        procNodeRef.current.disconnect();
+      } catch {
+        // ignore
+      }
+      procNodeRef.current.onaudioprocess = null;
+      procNodeRef.current = null;
+    }
+    if (micStreamRef.current) {
+      for (const t of micStreamRef.current.getTracks()) t.stop();
+      micStreamRef.current = null;
+    }
+    if (captureCtxRef.current) {
+      try {
+        await captureCtxRef.current.close();
+      } catch {
+        // ignore
+      }
+      captureCtxRef.current = null;
+    }
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      try {
+        wsRef.current.send(JSON.stringify({ event: "stop", streamSid }));
+      } catch {
+        // ignore
+      }
+      try {
+        wsRef.current.close();
+      } catch {
+        // ignore
+      }
+    }
+    wsRef.current = null;
+    setMicEnabled(false);
+    setState({ kind: "done", msg: "停止しました" });
+
+    // outbound保存リンク作成（セッション中に受け取った分）
+    const merged = mergeChunks(outboundMulawRef.current);
+    if (merged.length > 0) {
+      const pcmOut = muLawToPcm16(merged);
+      const wavBlob = pcm16ToWavBlob(pcmOut, 8000);
+      setOutWavUrl(URL.createObjectURL(wavBlob));
+      setOutMulawUrl(URL.createObjectURL(new Blob([merged], { type: "application/octet-stream" })));
+    }
+  }
+
   return (
     <div className="sim">
       <div className="panelHeader">
         <div className="panelTitle">疑似電話（ブラウザ）</div>
-        <div className="panelMeta">Twilio Media Streams互換WSに音声ファイルを流し込みます</div>
+        <div className="panelMeta">Twilio Media Streams互換WSに「マイク」または「音声ファイル」を流し込みます</div>
       </div>
 
       <div className="simBody">
         <div className="simGrid">
+          <div className="simMode">
+            <button className={`tab ${mode === "mic" ? "active" : ""}`} onClick={() => setMode("mic")} type="button">
+              マイク（リアルタイム）
+            </button>
+            <button className={`tab ${mode === "file" ? "active" : ""}`} onClick={() => setMode("file")} type="button">
+              音声ファイル
+            </button>
+          </div>
+
           <label className="simField">
             <div className="simLabel">WebSocket URL</div>
             <input className="simInput" value={wsUrl} onChange={(e) => setWsUrl(e.target.value)} />
@@ -278,22 +566,40 @@ export default function SimulateCall() {
             </label>
           </div>
 
-          <label className="simField">
-            <div className="simLabel">入力音声ファイル</div>
-            <input
-              className="simInput"
-              type="file"
-              accept="audio/*"
-              onChange={(e) => setFile(e.target.files?.[0] || null)}
-            />
-            <div className="simHelp">任意の音声（wav/mp3等）→ブラウザで8kHz/monoへ変換して送ります</div>
-          </label>
+          {mode === "file" ? (
+            <label className="simField">
+              <div className="simLabel">入力音声ファイル</div>
+              <input
+                className="simInput"
+                type="file"
+                accept="audio/*"
+                onChange={(e) => setFile(e.target.files?.[0] || null)}
+              />
+              <div className="simHelp">任意の音声（wav/mp3等）→ブラウザで8kHz/monoへ変換して送ります</div>
+            </label>
+          ) : (
+            <div className="simHelp">
+              - **マイク権限が必要**です（初回はブラウザが確認を出します）<br />
+              - **スピーカーだと回り込み**で誤検知しやすいので、できればヘッドホン推奨です
+            </div>
+          )}
         </div>
 
         <div className="simActions">
-          <button className="simBtn" onClick={run} disabled={state.kind === "preparing" || state.kind === "running"}>
-            送信してテスト
-          </button>
+          {mode === "mic" ? (
+            <div className="simActionRow">
+              <button className="simBtn" onClick={() => startMic()} disabled={micEnabled || state.kind === "preparing"}>
+                マイクで開始
+              </button>
+              <button className="simBtn" onClick={() => stopMic()} disabled={!micEnabled}>
+                停止
+              </button>
+            </div>
+          ) : (
+            <button className="simBtn" onClick={runFile} disabled={state.kind === "preparing" || state.kind === "running"}>
+              送信してテスト
+            </button>
+          )}
           <div className="simStatus">
             <span className={`simPill ${state.kind}`}>{state.kind}</span>
             <span className="muted">{state.msg}</span>
@@ -303,9 +609,10 @@ export default function SimulateCall() {
         <div className="panelDivider" />
 
         <div className="simResults">
-          <div className="panelTitle">受信（outbound）</div>
+          <div className="panelTitle">送受信</div>
+          <div className="muted">sent chunks={sentChunks} / bytes={sentBytes}</div>
           <div className="muted">
-            chunks={outboundChunks} / bytes={outboundBytes}
+            outbound chunks={outboundChunks} / bytes={outboundBytes}
           </div>
           {outWavUrl ? (
             <div className="simAudio">

@@ -247,6 +247,17 @@
   gap: 12px;
 }
 
+.simMode {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.simActionRow {
+  display: flex;
+  gap: 10px;
+}
+
 .simRow {
   display: grid;
   grid-template-columns: repeat(4, minmax(120px, 1fr));
