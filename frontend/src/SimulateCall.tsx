@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { muLawToPcm16, pcm16ToMuLaw } from "./audio/mulaw";
 import { pcm16ToWavBlob } from "./audio/wav";
+import { DEFAULT_MEDIA_STREAM_WS_BASE } from "./appConfig";
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -30,35 +31,6 @@ function base64ToBytes(b64: string): Uint8Array {
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) & 0xff;
   return out;
-}
-
-async function decodeAndResampleTo8kMono(file: File): Promise<Int16Array> {
-  const arrayBuffer = await file.arrayBuffer();
-  const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-  const decoded = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
-
-  // Resample with OfflineAudioContext to 8000Hz, mono
-  const targetRate = 8000;
-  const length = Math.max(1, Math.ceil(decoded.duration * targetRate));
-  const offline = new OfflineAudioContext(1, length, targetRate);
-  const src = offline.createBufferSource();
-  src.buffer = decoded;
-  src.connect(offline.destination);
-  src.start(0);
-  const rendered = await offline.startRendering();
-  try {
-    await audioCtx.close();
-  } catch {
-    // ignore
-  }
-
-  const ch0 = rendered.getChannelData(0);
-  const pcm16 = new Int16Array(ch0.length);
-  for (let i = 0; i < ch0.length; i++) {
-    const v = Math.max(-1, Math.min(1, ch0[i]));
-    pcm16[i] = (v < 0 ? v * 32768 : v * 32767) | 0;
-  }
-  return pcm16;
 }
 
 type ResampleState = {
@@ -104,7 +76,6 @@ type SimState = {
 };
 
 export default function SimulateCall() {
-  const [mode, setMode] = useState<"mic" | "file">("mic");
   const [wsUrl, setWsUrl] = useState("");
   const [callSid, setCallSid] = useState(() => randomId("SIM_CALL_"));
   const [streamSid, setStreamSid] = useState(() => randomId("SIM_STREAM_"));
@@ -112,7 +83,6 @@ export default function SimulateCall() {
   const [chunkBytes, setChunkBytes] = useState(160);
   const [chunkMs, setChunkMs] = useState(20);
   const [waitBeforeSpeakMs, setWaitBeforeSpeakMs] = useState(250);
-  const [file, setFile] = useState<File | null>(null);
   const [state, setState] = useState<SimState>({ kind: "idle", msg: "" });
 
   const [micEnabled, setMicEnabled] = useState(false);
@@ -136,11 +106,9 @@ export default function SimulateCall() {
   const playAtRef = useRef<number>(0);
 
   const wsUrlAuto = useMemo(() => {
-    // フロントと同一ドメインでリバプロしている場合はこれで動く。違う場合は手入力でOK。
-    const u = new URL(window.location.href);
-    u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-    u.pathname = "/streams";
-    u.search = "";
+    // Hosting(owldial.web.app) は WebSocket の upgrade を扱えないため、
+    // デフォルトは Cloud Run(media-stream) の /streams を使う。
+    const u = new URL(DEFAULT_MEDIA_STREAM_WS_BASE);
     u.searchParams.set("callSid", callSid);
     return u.toString();
   }, [callSid]);
@@ -283,73 +251,6 @@ export default function SimulateCall() {
     playAtRef.current = startAt + buf.duration;
   }
 
-  async function runFile() {
-    if (!file) {
-      setState({ kind: "error", msg: "入力音声ファイルを選択してください" });
-      return;
-    }
-    setState({ kind: "preparing", msg: "音声を8kHz/monoに変換中…" });
-    setSentBytes(0);
-    setSentChunks(0);
-    setOutboundBytes(0);
-    setOutboundChunks(0);
-    outboundMulawRef.current = [];
-    if (outWavUrl) URL.revokeObjectURL(outWavUrl);
-    if (outMulawUrl) URL.revokeObjectURL(outMulawUrl);
-    setOutWavUrl(null);
-    setOutMulawUrl(null);
-
-    // Inbound: File -> PCM16 -> mulaw
-    const pcm16 = await decodeAndResampleTo8kMono(file);
-    const inboundMulaw = pcm16ToMuLaw(pcm16);
-    const totalSeconds = inboundMulaw.length / 8000;
-
-    setState({ kind: "preparing", msg: `WS接続中…（inbound 約${totalSeconds.toFixed(2)}秒）` });
-    const ws = await connectWs();
-
-    await sleep(waitBeforeSpeakMs);
-
-    const totalChunks = Math.ceil(inboundMulaw.length / chunkBytes);
-    setState({ kind: "running", msg: `inbound送信中… chunks=${totalChunks}` });
-
-    for (let i = 0; i < totalChunks; i++) {
-      const start = i * chunkBytes;
-      const end = Math.min(start + chunkBytes, inboundMulaw.length);
-      const chunk = inboundMulaw.subarray(start, end);
-      ws.send(
-        JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: bytesToBase64(chunk), track: "inbound" },
-        })
-      );
-      setSentChunks((x) => x + 1);
-      setSentBytes((x) => x + chunk.length);
-      if (i < totalChunks - 1) {
-        await sleep(Math.max(0, Math.floor(chunkMs / pace)));
-      }
-    }
-
-    ws.send(JSON.stringify({ event: "stop", streamSid }));
-    setState({ kind: "running", msg: "stop送信。outbound受信待ち…" });
-    await sleep(1500);
-    ws.close();
-
-    const merged = mergeChunks(outboundMulawRef.current);
-    if (merged.length > 0) {
-      const pcmOut = muLawToPcm16(merged);
-      const wavBlob = pcm16ToWavBlob(pcmOut, 8000);
-      const wavUrl = URL.createObjectURL(wavBlob);
-      setOutWavUrl(wavUrl);
-
-      const mulawBlob = new Blob([merged], { type: "application/octet-stream" });
-      const mulawUrl = URL.createObjectURL(mulawBlob);
-      setOutMulawUrl(mulawUrl);
-    }
-
-    setState({ kind: "done", msg: "完了" });
-  }
-
   async function startMic() {
     if (micEnabled) return;
     setState({ kind: "preparing", msg: "マイク許可をリクエスト中…" });
@@ -367,68 +268,74 @@ export default function SimulateCall() {
     setOutWavUrl(null);
     setOutMulawUrl(null);
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      } as any,
-    });
-    micStreamRef.current = stream;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        } as any,
+      });
+      micStreamRef.current = stream;
 
-    const captureCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-    captureCtxRef.current = captureCtx;
+      const captureCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      captureCtxRef.current = captureCtx;
 
-    // Playback context init (so first audio starts quickly)
-    ensurePlaybackCtx();
+      // Playback context init (so first audio starts quickly)
+      ensurePlaybackCtx();
 
-    const ws = await connectWs();
-    setState({ kind: "running", msg: "マイク送信中（ヘッドホン推奨）" });
+      setState({ kind: "preparing", msg: "WebSocket接続中…" });
+      await connectWs();
+      setState({ kind: "running", msg: "マイク送信中（ヘッドホン推奨）" });
 
-    const src = captureCtx.createMediaStreamSource(stream);
-    const proc = captureCtx.createScriptProcessor(4096, 1, 1);
-    procNodeRef.current = proc;
+      const src = captureCtx.createMediaStreamSource(stream);
+      const proc = captureCtx.createScriptProcessor(4096, 1, 1);
+      procNodeRef.current = proc;
 
-    proc.onaudioprocess = (ev) => {
-      try {
-        const input = ev.inputBuffer.getChannelData(0);
-        const pcm8k = resampleTo8kLinear(input, captureCtx.sampleRate, resampleRef.current);
-        if (!pcm8k.length) return;
-        const mulaw = pcm16ToMuLaw(pcm8k);
-        appendToSendQueue(mulaw);
-      } catch {
-        // ignore
-      }
-    };
+      proc.onaudioprocess = (ev) => {
+        try {
+          const input = ev.inputBuffer.getChannelData(0);
+          const pcm8k = resampleTo8kLinear(input, captureCtx.sampleRate, resampleRef.current);
+          if (!pcm8k.length) return;
+          const mulaw = pcm16ToMuLaw(pcm8k);
+          appendToSendQueue(mulaw);
+        } catch {
+          // ignore
+        }
+      };
 
-    src.connect(proc);
-    // Connect to destination with zero gain to keep node alive without audible feedback
-    const zero = captureCtx.createGain();
-    zero.gain.value = 0;
-    proc.connect(zero);
-    zero.connect(captureCtx.destination);
+      src.connect(proc);
+      // Connect to destination with zero gain to keep node alive without audible feedback
+      const zero = captureCtx.createGain();
+      zero.gain.value = 0;
+      proc.connect(zero);
+      zero.connect(captureCtx.destination);
 
-    const tick = Math.max(5, chunkMs);
-    sendTimerRef.current = window.setInterval(() => {
-      try {
-        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-        const chunk = takeFromSendQueue(chunkBytes);
-        if (!chunk) return;
-        ws.send(
-          JSON.stringify({
-            event: "media",
-            streamSid,
-            media: { payload: bytesToBase64(chunk), track: "inbound" },
-          })
-        );
-        setSentChunks((x) => x + 1);
-        setSentBytes((x) => x + chunk.length);
-      } catch {
-        // ignore
-      }
-    }, tick);
+      const tick = Math.max(5, chunkMs);
+      sendTimerRef.current = window.setInterval(() => {
+        try {
+          if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+          const chunk = takeFromSendQueue(chunkBytes);
+          if (!chunk) return;
+          wsRef.current.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: { payload: bytesToBase64(chunk), track: "inbound" },
+            })
+          );
+          setSentChunks((x) => x + 1);
+          setSentBytes((x) => x + chunk.length);
+        } catch {
+          // ignore
+        }
+      }, tick);
 
-    setMicEnabled(true);
+      setMicEnabled(true);
+    } catch (e: any) {
+      await stopMic();
+      setState({ kind: "error", msg: e?.message ? `開始できません: ${e.message}` : "開始できません" });
+    }
   }
 
   async function stopMic() {
@@ -487,24 +394,15 @@ export default function SimulateCall() {
     <div className="sim">
       <div className="panelHeader">
         <div className="panelTitle">疑似電話（ブラウザ）</div>
-        <div className="panelMeta">Twilio Media Streams互換WSに「マイク」または「音声ファイル」を流し込みます</div>
+        <div className="panelMeta">マイクをリアルタイムに Twilio Media Streams互換WS（/streams）へ送信します</div>
       </div>
 
       <div className="simBody">
         <div className="simGrid">
-          <div className="simMode">
-            <button className={`tab ${mode === "mic" ? "active" : ""}`} onClick={() => setMode("mic")} type="button">
-              マイク（リアルタイム）
-            </button>
-            <button className={`tab ${mode === "file" ? "active" : ""}`} onClick={() => setMode("file")} type="button">
-              音声ファイル
-            </button>
-          </div>
-
           <label className="simField">
             <div className="simLabel">WebSocket URL</div>
             <input className="simInput" value={wsUrl} onChange={(e) => setWsUrl(e.target.value)} />
-            <div className="simHelp">例: `wss://.../streams?callSid=...`（httpsページからは wss 推奨）</div>
+            <div className="simHelp">例: `wss://media-stream-...a.run.app/streams?callSid=...`（HostingドメインはWS不可）</div>
           </label>
 
           <label className="simField">
@@ -566,40 +464,21 @@ export default function SimulateCall() {
             </label>
           </div>
 
-          {mode === "file" ? (
-            <label className="simField">
-              <div className="simLabel">入力音声ファイル</div>
-              <input
-                className="simInput"
-                type="file"
-                accept="audio/*"
-                onChange={(e) => setFile(e.target.files?.[0] || null)}
-              />
-              <div className="simHelp">任意の音声（wav/mp3等）→ブラウザで8kHz/monoへ変換して送ります</div>
-            </label>
-          ) : (
-            <div className="simHelp">
-              - **マイク権限が必要**です（初回はブラウザが確認を出します）<br />
-              - **スピーカーだと回り込み**で誤検知しやすいので、できればヘッドホン推奨です
-            </div>
-          )}
+          <div className="simHelp">
+            - **マイク権限が必要**です（初回はブラウザが確認を出します）<br />
+            - **スピーカーだと回り込み**で誤検知しやすいので、できればヘッドホン推奨です
+          </div>
         </div>
 
         <div className="simActions">
-          {mode === "mic" ? (
-            <div className="simActionRow">
-              <button className="simBtn" onClick={() => startMic()} disabled={micEnabled || state.kind === "preparing"}>
-                マイクで開始
-              </button>
-              <button className="simBtn" onClick={() => stopMic()} disabled={!micEnabled}>
-                停止
-              </button>
-            </div>
-          ) : (
-            <button className="simBtn" onClick={runFile} disabled={state.kind === "preparing" || state.kind === "running"}>
-              送信してテスト
+          <div className="simActionRow">
+            <button className="simBtn" onClick={() => startMic()} disabled={micEnabled || state.kind === "preparing"}>
+              マイクで開始
             </button>
-          )}
+            <button className="simBtn" onClick={() => stopMic()} disabled={!micEnabled}>
+              停止
+            </button>
+          </div>
           <div className="simStatus">
             <span className={`simPill ${state.kind}`}>{state.kind}</span>
             <span className="muted">{state.msg}</span>

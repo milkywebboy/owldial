@@ -247,12 +247,6 @@
   gap: 12px;
 }
 
-.simMode {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
 .simActionRow {
   display: flex;
   gap: 10px;
