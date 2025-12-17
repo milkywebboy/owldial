@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g1" x1="96" y1="64" x2="416" y2="448" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0E6A78"/>
+      <stop offset="1" stop-color="#0A3E4A"/>
+    </linearGradient>
+    <linearGradient id="beak" x1="246" y1="212" x2="266" y2="270" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFB86B"/>
+      <stop offset="1" stop-color="#E88B2E"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <!-- Owl head/body -->
+  <g filter="url(#shadow)">
+    <path d="M128 150c-38 8-66 42-66 82 0 110 86 198 194 198s194-88 194-198c0-40-28-74-66-82-14-44-54-74-102-74-20 0-38 5-54 14-16-9-34-14-54-14-48 0-88 30-102 74z" fill="url(#g1)"/>
+
+    <!-- ears -->
+    <path d="M140 118c8-34 34-58 70-58-20 18-30 44-26 72-18-14-30-14-44-14z" fill="#0B4250" opacity="0.95"/>
+    <path d="M372 118c-14 0-26 0-44 14 4-28-6-54-26-72 36 0 62 24 70 58z" fill="#0B4250" opacity="0.95"/>
+
+    <!-- face mask -->
+    <path d="M170 198c0-56 38-96 86-96 48 0 86 40 86 96 0 48-22 88-86 88-64 0-86-40-86-88z" fill="#F3F7FF" opacity="0.97"/>
+
+    <!-- eyes -->
+    <circle cx="210" cy="212" r="66" fill="#F3F7FF"/>
+    <circle cx="302" cy="212" r="66" fill="#F3F7FF"/>
+    <circle cx="210" cy="212" r="38" fill="#093A45"/>
+    <circle cx="302" cy="212" r="38" fill="#093A45"/>
+    <circle cx="226" cy="198" r="8" fill="#F3F7FF" opacity="0.9"/>
+    <circle cx="318" cy="198" r="8" fill="#F3F7FF" opacity="0.9"/>
+
+    <!-- beak -->
+    <path d="M256 226c18 0 34 10 34 26 0 20-20 34-34 44-14-10-34-24-34-44 0-16 16-26 34-26z" fill="url(#beak)"/>
+
+    <!-- belly highlight -->
+    <path d="M156 290c8 62 54 118 100 118 46 0 92-56 100-118-24 40-68 62-100 62s-76-22-100-62z" fill="#F3F7FF" opacity="0.14"/>
+  </g>
+</svg>
+
+

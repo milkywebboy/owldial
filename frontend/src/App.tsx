@@ -65,8 +65,13 @@ export default function App() {
     <div className="page">
       <header className="header">
         <div className="brand">
-          <div className="title">owldial</div>
-          <div className="subtitle">通話ログ（Firestore: calls）</div>
+          <div className="brandRow">
+            <img className="logo" src={`${process.env.PUBLIC_URL}/logo.svg`} alt="owldial logo" />
+            <div>
+              <div className="title">owldial</div>
+              <div className="subtitle">通話ログ（Firestore: calls）</div>
+            </div>
+          </div>
         </div>
         <div className="hint">
           {!hasProjectId ? (

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="48" y1="32" x2="208" y2="224" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0E6A78"/>
+      <stop offset="1" stop-color="#0A3E4A"/>
+    </linearGradient>
+    <linearGradient id="beak" x1="122" y1="112" x2="134" y2="148" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFB86B"/>
+      <stop offset="1" stop-color="#E88B2E"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="16" y="16" width="224" height="224" rx="56" fill="url(#g)"/>
+  <path d="M84 110c0-34 20-58 44-58 24 0 44 24 44 58 0 28-12 50-44 50-32 0-44-22-44-50z" fill="#F3F7FF" opacity="0.95"/>
+  <circle cx="98" cy="112" r="22" fill="#F3F7FF"/>
+  <circle cx="158" cy="112" r="22" fill="#F3F7FF"/>
+  <circle cx="98" cy="112" r="12" fill="#093A45"/>
+  <circle cx="158" cy="112" r="12" fill="#093A45"/>
+  <path d="M128 118c10 0 18 6 18 14 0 10-10 18-18 24-8-6-18-14-18-24 0-8 8-14 18-14z" fill="url(#beak)"/>
+</svg>
+
+
