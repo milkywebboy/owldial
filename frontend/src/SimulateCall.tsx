@@ -2,6 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { muLawToPcm16, pcm16ToMuLaw } from "./audio/mulaw";
 import { pcm16ToWavBlob } from "./audio/wav";
 import { DEFAULT_MEDIA_STREAM_WS_BASE } from "./appConfig";
+import { getApp, getApps, initializeApp } from "firebase/app";
+import { doc, getFirestore, onSnapshot, Timestamp } from "firebase/firestore";
+import { getFirebaseWebConfigFromEnvOrDefault } from "./firebaseConfig";
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -75,6 +78,13 @@ type SimState = {
   msg: string;
 };
 
+type AssistantUtterance = {
+  role?: "assistant";
+  content?: string;
+  label?: string;
+  timestamp?: Timestamp;
+};
+
 export default function SimulateCall() {
   const [wsUrl, setWsUrl] = useState("");
   const [callSid, setCallSid] = useState(() => randomId("SIM_CALL_"));
@@ -92,6 +102,12 @@ export default function SimulateCall() {
   const [rtInterim, setRtInterim] = useState("");
   const [rtFinal, setRtFinal] = useState<string[]>([]);
   const recognitionRef = useRef<any>(null);
+
+  // Server-side realtime transcript (Firestore)
+  const { cfg, hasProjectId } = useMemo(() => getFirebaseWebConfigFromEnvOrDefault(), []);
+  const [fsRtFinal, setFsRtFinal] = useState("");
+  const [fsRtInterim, setFsRtInterim] = useState("");
+  const [fsAssistant, setFsAssistant] = useState<AssistantUtterance[]>([]);
 
   const [outboundBytes, setOutboundBytes] = useState(0);
   const [outboundChunks, setOutboundChunks] = useState(0);
@@ -119,6 +135,30 @@ export default function SimulateCall() {
     u.searchParams.set("callSid", callSid);
     return u.toString();
   }, [callSid]);
+
+  useEffect(() => {
+    if (!hasProjectId) return;
+    try {
+      const app = getApps().length ? getApp() : initializeApp(cfg);
+      const db = getFirestore(app);
+      const ref = doc(db, "calls", callSid);
+      const unsub = onSnapshot(
+        ref,
+        (snap) => {
+          const d: any = snap.exists() ? snap.data() : {};
+          setFsRtFinal(String(d?.realtimeTranscript || ""));
+          setFsRtInterim(String(d?.realtimeTranscriptInterim || ""));
+          setFsAssistant(Array.isArray(d?.realtimeAssistantUtterances) ? d.realtimeAssistantUtterances : []);
+        },
+        () => {
+          // ignore (simulator should still work without Firestore)
+        }
+      );
+      return () => unsub();
+    } catch {
+      // ignore
+    }
+  }, [callSid, cfg, hasProjectId]);
 
   useEffect(() => {
     // wsUrl が未入力のときだけ自動補完（手入力を上書きしない）
@@ -633,6 +673,32 @@ export default function SimulateCall() {
             ) : null}
             {!rtFinal.length && !rtInterim ? <div className="empty">まだありません</div> : null}
           </div>
+
+          <div className="panelDivider" />
+          <div className="panelTitle">リアルタイム文字起こし（サーバ/Firestore：顧客 + AI）</div>
+          <div className="muted">※通話サーバ側で生成した転写/相槌/返答のリアルタイム表示です。</div>
+          <div className="chat">
+            {fsRtFinal ? (
+              <div className="msg user">
+                <div className="msgRole">user (server final)</div>
+                <div className="msgText">{fsRtFinal}</div>
+              </div>
+            ) : null}
+            {fsRtInterim ? (
+              <div className="msg user">
+                <div className="msgRole">user (server interim)</div>
+                <div className="msgText">{fsRtInterim}</div>
+              </div>
+            ) : null}
+            {fsAssistant.slice(-30).map((m, idx) => (
+              <div key={idx} className="msg assistant">
+                <div className="msgRole">{`assistant (server${m.label ? `:${m.label}` : ""})`}</div>
+                <div className="msgText">{m.content || ""}</div>
+              </div>
+            ))}
+            {!fsRtFinal && !fsRtInterim && fsAssistant.length === 0 ? <div className="empty">まだありません</div> : null}
+          </div>
+
           {outWavUrl ? (
             <div className="simAudio">
               <audio controls src={outWavUrl} />
