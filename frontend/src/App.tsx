@@ -17,6 +17,8 @@ type Conversation = {
   role: "user" | "assistant";
   content: string;
   timestamp?: Timestamp;
+  label?: string;
+  kind?: string;
 };
 
 type CallDoc = {
@@ -32,6 +34,13 @@ type CallDoc = {
   realtimeTranscript?: string;
   realtimeTranscriptInterim?: string;
   realtimeTranscriptUpdatedAt?: Timestamp;
+  realtimeAssistantUtterances?: Array<{
+    role?: "assistant";
+    content?: string;
+    label?: string;
+    timestamp?: Timestamp;
+  }>;
+  realtimeAssistantUpdatedAt?: Timestamp;
 };
 
 export default function App() {
@@ -193,6 +202,21 @@ export default function App() {
                       <div className="msgText">{selected.data.realtimeTranscriptInterim}</div>
                     </div>
                   ) : null}
+                </>
+              ) : null}
+
+              {selected.data.realtimeAssistantUtterances?.length ? (
+                <>
+                  <div className="panelDivider" />
+                  <div className="panelTitle">AI（相槌/返答）リアルタイム</div>
+                  <div className="chat">
+                    {selected.data.realtimeAssistantUtterances.slice(-30).map((m, idx) => (
+                      <div key={idx} className="msg assistant">
+                        <div className="msgRole">{`assistant (rt${m.label ? `:${m.label}` : ""})`}</div>
+                        <div className="msgText">{m.content || ""}</div>
+                      </div>
+                    ))}
+                  </div>
                 </>
               ) : null}
               </div>

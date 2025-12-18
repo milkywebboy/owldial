@@ -171,6 +171,38 @@ function scheduleRealtimeTranscriptFlush(session) {
   }, Number(process.env.RT_TRANSCRIPT_FLUSH_MS || "500"));
 }
 
+async function appendAssistantRealtimeText(session, text, label) {
+  try {
+    if (!session || !session.callSid) return;
+    const t = (text || "").trim();
+    if (!t) return;
+    const callRef = db.collection("calls").doc(session.callSid);
+    const FieldValue = require("firebase-admin/firestore").FieldValue;
+    await callRef.set(
+      {
+        callSid: session.callSid,
+        status: session.status || "active",
+        realtimeAssistantUtterances: FieldValue.arrayUnion({
+          role: "assistant",
+          content: t,
+          label: label || "assistant",
+          timestamp: Timestamp.now(),
+        }),
+        realtimeAssistantUpdatedAt: Timestamp.now(),
+        // 既存UI（会話）にも出したいので conversations にも入れる（相槌/挨拶がリアルタイム表示される）
+        conversations: FieldValue.arrayUnion({
+          role: "assistant",
+          content: t,
+          timestamp: Timestamp.now(),
+        }),
+      },
+      { merge: true }
+    );
+  } catch (e) {
+    console.warn(`[RT-AI] append_failed call=${session?.callSid || "unknown"} err=${e.message}`);
+  }
+}
+
 function startRealtimeGoogleSttIfNeeded(session) {
   try {
     if (!session || !session.callSid) return;
@@ -532,6 +564,8 @@ async function maybePlayFillerAizuchi(session) {
     if (!buf) return;
 
     console.log(`[FILLER] Playing aizuchi call=${session.callSid} bytes=${buf.length}`);
+    // 相槌もリアルタイム文字起こしとして表示（生成テキストをそのまま記録）
+    appendAssistantRealtimeText(session, FILLER_TEXT_THINKING, "filler").catch(() => {});
     session._fillerActive = true;
     // 非同期で送信（返答生成と並列化）
     const p = sendAudioViaWebSocket(session, buf, { label: "filler" });
@@ -1366,6 +1400,8 @@ async function sendInitialMessage(session) {
     // デフォルト音声が見つかった場合は、Firestore待ちせずに即送信
     if (mulawBuffer) {
       console.log(`[INIT] Using pre-generated audio (default fast-path) for call ${callSid}, size: ${mulawBuffer.length} bytes`);
+      // 初期挨拶もリアルタイム文字起こしとして表示（生成テキストをそのまま記録）
+      appendAssistantRealtimeText(session, "お電話ありがとうございます。テックファンドです。", "greeting").catch(() => {});
       session.initialMessageSent = true;
       await sendAudioViaWebSocket(session, mulawBuffer, { label: "greeting", uninterruptible: true });
       console.log(`[INIT] Pre-generated initial audio sent successfully for call ${callSid}`);
@@ -1409,6 +1445,7 @@ async function sendInitialMessage(session) {
     } else {
       // 事前生成された音声を送信（設定に基づく）
       console.log(`[INIT] Using pre-generated audio (Firestore) for call ${callSid}, size: ${mulawBuffer.length} bytes`);
+      appendAssistantRealtimeText(session, "お電話ありがとうございます。テックファンドです。", "greeting").catch(() => {});
       session.initialMessageSent = true;
       // 初期挨拶は中断しない（ユーザー要望）
       await sendAudioViaWebSocket(session, mulawBuffer, { label: "greeting", uninterruptible: true });
