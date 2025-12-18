@@ -734,8 +734,14 @@ async function handleInboundMediaMessage(session, message) {
 
   // 発話中：レベルに関係なくフレームを連続で追加
   session._segmentBuffers.push(audioData);
+  // NOTE:
+  // - 以前は continueThreshold を下回ると lastIncomingAudioTime が更新されず、
+  //   小声/抑揚/息継ぎで「無音扱い」→ eos_confirmed が早発 → 相槌が割り込む原因になっていた。
+  // - 発話開始が確定して _speechActive になった後は、レベル閾値ではなく「実質無音かどうか」で継続判定を行う。
+  const silenceLevel = Number(process.env.VAD_SILENCE_LEVEL || "0.2"); // audioLevel(0..100) のスケール
+  const frameLooksSilent = audioLevel <= silenceLevel;
   // 継続判定は開始判定より緩くする（小声/抑揚で切れないように）
-  if (isSpeechContinueFrame) {
+  if (isSpeechContinueFrame || !frameLooksSilent) {
     session.lastIncomingAudioTime = now;
     session._segmentLastNonSilentIndex = session._segmentBuffers.length - 1;
     session._lastSpeechMs = now;
@@ -745,7 +751,7 @@ async function handleInboundMediaMessage(session, message) {
   const silenceThresholdMs = Number(process.env.SILENCE_MS || "300");
   const lastSpeechAt = session.lastIncomingAudioTime || session._speechStartMs || now;
   const silenceMs = now - lastSpeechAt;
-  if (session._speechActive && silenceMs > silenceThresholdMs && !isSpeechContinueFrame) {
+  if (session._speechActive && silenceMs > silenceThresholdMs && frameLooksSilent) {
     const endAt = now;
     const keepCount = Math.max(0, session._segmentLastNonSilentIndex + 1);
     const kept = session._segmentBuffers.slice(0, keepCount);
