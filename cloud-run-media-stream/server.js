@@ -171,31 +171,33 @@ function scheduleRealtimeTranscriptFlush(session) {
   }, Number(process.env.RT_TRANSCRIPT_FLUSH_MS || "500"));
 }
 
-async function appendAssistantRealtimeText(session, text, label) {
+async function appendAssistantRealtimeText(session, text, label, addToConversations) {
   try {
     if (!session || !session.callSid) return;
     const t = (text || "").trim();
     if (!t) return;
     const callRef = db.collection("calls").doc(session.callSid);
     const FieldValue = require("firebase-admin/firestore").FieldValue;
+    const base = {
+      callSid: session.callSid,
+      status: session.status || "active",
+      realtimeAssistantUtterances: FieldValue.arrayUnion({
+        role: "assistant",
+        content: t,
+        label: label || "assistant",
+        timestamp: Timestamp.now(),
+      }),
+      realtimeAssistantUpdatedAt: Timestamp.now(),
+    };
+    if (addToConversations) {
+      base.conversations = FieldValue.arrayUnion({
+        role: "assistant",
+        content: t,
+        timestamp: Timestamp.now(),
+      });
+    }
     await callRef.set(
-      {
-        callSid: session.callSid,
-        status: session.status || "active",
-        realtimeAssistantUtterances: FieldValue.arrayUnion({
-          role: "assistant",
-          content: t,
-          label: label || "assistant",
-          timestamp: Timestamp.now(),
-        }),
-        realtimeAssistantUpdatedAt: Timestamp.now(),
-        // 既存UI（会話）にも出したいので conversations にも入れる（相槌/挨拶がリアルタイム表示される）
-        conversations: FieldValue.arrayUnion({
-          role: "assistant",
-          content: t,
-          timestamp: Timestamp.now(),
-        }),
-      },
+      base,
       { merge: true }
     );
   } catch (e) {
@@ -565,7 +567,7 @@ async function maybePlayFillerAizuchi(session) {
 
     console.log(`[FILLER] Playing aizuchi call=${session.callSid} bytes=${buf.length}`);
     // 相槌もリアルタイム文字起こしとして表示（生成テキストをそのまま記録）
-    appendAssistantRealtimeText(session, FILLER_TEXT_THINKING, "filler").catch(() => {});
+    appendAssistantRealtimeText(session, FILLER_TEXT_THINKING, "filler", true).catch(() => {});
     session._fillerActive = true;
     // 非同期で送信（返答生成と並列化）
     const p = sendAudioViaWebSocket(session, buf, { label: "filler" });
@@ -1171,6 +1173,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     if (cls.action === "farewell") {
       const farewell = "承知しました。失礼いたします。";
       console.log(`[FLOW] farewell call=${callSid}`);
+      appendAssistantRealtimeText(session, farewell, "farewell", false).catch(() => {});
       const tFs2 = Date.now();
       await callRef.set(
         {
@@ -1193,6 +1196,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     if (cls.action === "take_message") {
       const prompt = "恐れ入りますが担当者へお繋ぎできません。伝言として承りますので、ご用件と、お名前・折り返し先（電話番号）をお話しください。";
       console.log(`[FLOW] take_message call=${callSid}`);
+      appendAssistantRealtimeText(session, prompt, "take_message", false).catch(() => {});
       const tFs2 = Date.now();
       await callRef.set(
         {
@@ -1227,6 +1231,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       } catch (_) {}
 
       const closing = `承知しました。${CLOSING_TEXT}`;
+      appendAssistantRealtimeText(session, closing, "closing", false).catch(() => {});
       const tFs2 = Date.now();
       await callRef.set(
         {
@@ -1250,6 +1255,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     if (session._closingAsked && detectNoMoreRequests(userMessage)) {
       const farewell = "承知しました。失礼いたします。";
       console.log(`[FLOW] no_more_requests_fallback call=${callSid}`);
+      appendAssistantRealtimeText(session, farewell, "farewell", false).catch(() => {});
       const tFs2 = Date.now();
       await callRef.set(
         {
@@ -1301,6 +1307,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       aiResponse = aiResponse.slice(0, maxChars).trimEnd() + "…";
     }
     console.log(`[AUDIO-IN] AI response for call ${callSid}: ${aiResponse}`);
+    appendAssistantRealtimeText(session, aiResponse, "ai_response", false).catch(() => {});
     
     // FirestoreにAI返答を保存
     const tFs2 = Date.now();
@@ -1416,7 +1423,7 @@ async function sendInitialMessage(session) {
     if (mulawBuffer) {
       console.log(`[INIT] Using pre-generated audio (default fast-path) for call ${callSid}, size: ${mulawBuffer.length} bytes`);
       // 初期挨拶もリアルタイム文字起こしとして表示（生成テキストをそのまま記録）
-      appendAssistantRealtimeText(session, "お電話ありがとうございます。テックファンドです。", "greeting").catch(() => {});
+      appendAssistantRealtimeText(session, "お電話ありがとうございます。テックファンドです。", "greeting", true).catch(() => {});
       session.initialMessageSent = true;
       await sendAudioViaWebSocket(session, mulawBuffer, { label: "greeting", uninterruptible: true });
       console.log(`[INIT] Pre-generated initial audio sent successfully for call ${callSid}`);
@@ -1460,7 +1467,7 @@ async function sendInitialMessage(session) {
     } else {
       // 事前生成された音声を送信（設定に基づく）
       console.log(`[INIT] Using pre-generated audio (Firestore) for call ${callSid}, size: ${mulawBuffer.length} bytes`);
-      appendAssistantRealtimeText(session, "お電話ありがとうございます。テックファンドです。", "greeting").catch(() => {});
+      appendAssistantRealtimeText(session, "お電話ありがとうございます。テックファンドです。", "greeting", true).catch(() => {});
       session.initialMessageSent = true;
       // 初期挨拶は中断しない（ユーザー要望）
       await sendAudioViaWebSocket(session, mulawBuffer, { label: "greeting", uninterruptible: true });

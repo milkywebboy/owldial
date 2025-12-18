@@ -189,10 +189,12 @@ export default function App() {
                   ) : null}
                 </div>
 
-              {selected.data.realtimeTranscript || selected.data.realtimeTranscriptInterim ? (
+              {selected.data.realtimeTranscript ||
+              selected.data.realtimeTranscriptInterim ||
+              selected.data.realtimeAssistantUtterances?.length ? (
                 <>
                   <div className="panelDivider" />
-                  <div className="panelTitle">リアルタイム文字起こし</div>
+                  <div className="panelTitle">リアルタイム文字起こし（顧客 + AI）</div>
                   {selected.data.realtimeTranscript ? (
                     <div className="msg user">
                       <div className="msgRole">user (rt final)</div>
@@ -205,21 +207,17 @@ export default function App() {
                       <div className="msgText">{selected.data.realtimeTranscriptInterim}</div>
                     </div>
                   ) : null}
-                </>
-              ) : null}
 
-              {selected.data.realtimeAssistantUtterances?.length ? (
-                <>
-                  <div className="panelDivider" />
-                  <div className="panelTitle">AI（相槌/返答）リアルタイム</div>
-                  <div className="chat">
-                    {selected.data.realtimeAssistantUtterances.slice(-30).map((m, idx) => (
-                      <div key={idx} className="msg assistant">
-                        <div className="msgRole">{`assistant (rt${m.label ? `:${m.label}` : ""})`}</div>
-                        <div className="msgText">{m.content || ""}</div>
-                      </div>
-                    ))}
-                  </div>
+                  {selected.data.realtimeAssistantUtterances?.length ? (
+                    <div className="chat">
+                      {selected.data.realtimeAssistantUtterances.slice(-30).map((m, idx) => (
+                        <div key={idx} className="msg assistant">
+                          <div className="msgRole">{`assistant (rt${m.label ? `:${m.label}` : ""})`}</div>
+                          <div className="msgText">{m.content || ""}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                 </>
               ) : null}
               </div>
