@@ -12,8 +12,8 @@
     "typescript": "^4.9.5"
   },
   "scripts": {
-    "start": "react-scripts start",
-    "build": "react-scripts build",
+    "start": "node scripts/write-version.js && react-scripts start",
+    "build": "node scripts/write-version.js && react-scripts build",
     "test": "react-scripts test",
     "eject": "react-scripts eject"
   },

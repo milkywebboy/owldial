@@ -12,6 +12,7 @@ import {
 import "./App.css";
 import SimulateCall from "./SimulateCall";
 import { getFirebaseWebConfigFromEnvOrDefault } from "./firebaseConfig";
+import { APP_VERSION } from "./version";
 
 type Conversation = {
   role: "user" | "assistant";
@@ -91,7 +92,9 @@ export default function App() {
               Firebase設定が未指定です（REACT_APP_FIREBASE_PROJECT_ID など）
             </span>
           ) : (
-            <span className="muted">project: {cfg.projectId}</span>
+            <span className="muted">
+              project: {cfg.projectId} <span className="mono">· v{APP_VERSION}</span>
+            </span>
           )}
         </div>
       </header>
