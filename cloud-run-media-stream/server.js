@@ -83,7 +83,34 @@ try {
 
 function getSttProvider() {
   // "google" | "openai"
-  return (process.env.STT_PROVIDER || "openai").toLowerCase();
+  const v = (process.env.STT_PROVIDER || "").toLowerCase().trim();
+  if (v) return v;
+  // デフォルトは Google（電話音声の日本語で有利）。speechClientが無い場合のみ openai にフォールバック。
+  return speechClient ? "google" : "openai";
+}
+
+function getGoogleSttSpeechContexts() {
+  const basePhrases = [
+    // 典型的な誤認識（例: 「お世話」→「朝」）を抑えるための汎用フレーズ
+    "お世話になっております",
+    "お世話になっております。", // punctuation付きも入れておく
+    "恐れ入ります",
+    "失礼いたします",
+    "承知しました",
+    "伝言",
+    "折り返し",
+    "担当者",
+  ];
+  const raw = String(process.env.GOOGLE_STT_HINTS || "").trim();
+  const extra = raw
+    ? raw.split(/[,\n|]/).map((s) => s.trim()).filter(Boolean)
+    : [];
+
+  const phrases = Array.from(new Set([...basePhrases, ...extra]));
+  if (!phrases.length) return undefined;
+
+  const boost = Number(process.env.GOOGLE_STT_HINT_BOOST || "15");
+  return [{ phrases, boost }];
 }
 
 async function transcribeWithGoogleSpeechMulaw(callSid, mulawBuffer) {
@@ -91,6 +118,7 @@ async function transcribeWithGoogleSpeechMulaw(callSid, mulawBuffer) {
   if (!speechClient) {
     throw new Error("Speech client not initialized");
   }
+  const speechContexts = getGoogleSttSpeechContexts();
   const request = {
     config: {
       encoding: "MULAW",
@@ -100,6 +128,7 @@ async function transcribeWithGoogleSpeechMulaw(callSid, mulawBuffer) {
       // 電話音声向け（利用できない場合はAPI側で無視/エラーになる可能性があるのでtry/catchで吸収）
       model: process.env.GOOGLE_STT_MODEL || "phone_call",
       useEnhanced: String(process.env.GOOGLE_STT_USE_ENHANCED || "true").toLowerCase() === "true",
+      ...(speechContexts ? { speechContexts } : {}),
     },
     audio: {
       content: mulawBuffer.toString("base64"),
@@ -235,6 +264,7 @@ function startRealtimeGoogleSttIfNeeded(session) {
     if (!speechClient) return;
     if (session._rtSttStream) return;
 
+    const speechContexts = getGoogleSttSpeechContexts();
     const request = {
       config: {
         encoding: "MULAW",
@@ -242,6 +272,9 @@ function startRealtimeGoogleSttIfNeeded(session) {
         languageCode: "ja-JP",
         enableAutomaticPunctuation: true,
         interimResults: true,
+        model: process.env.GOOGLE_STT_MODEL || "phone_call",
+        useEnhanced: String(process.env.GOOGLE_STT_USE_ENHANCED || "true").toLowerCase() === "true",
+        ...(speechContexts ? { speechContexts } : {}),
       },
       interimResults: true,
     };
