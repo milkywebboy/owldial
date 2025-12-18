@@ -335,6 +335,11 @@ const preGeneratedAudioCache = new Map();
 const fillerAudioCache = new Map();
 const FILLER_VERSION = process.env.FILLER_VERSION || "v3";
 
+// 思考中BGM（保留音）のメモリキャッシュ（Cloud Runインスタンス内）
+// key: `${BGM_VERSION}`
+const bgmAudioCache = new Map();
+const BGM_VERSION = process.env.BGM_VERSION || "v1";
+
 // 相槌（待ち）固定テキスト
 const FILLER_TEXT_THINKING = "はい、ありがとうございます。AIが思考中ですので少々お待ちください";
 
@@ -401,6 +406,134 @@ function getMergeWindowMs(session) {
     return Number(process.env.MERGE_WINDOW_MS_WHILE_PLAYING || String(base));
   }
   return base;
+}
+
+function sleepMs(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function getBgmCacheKey() {
+  return `${BGM_VERSION}`;
+}
+
+function getCachedThinkingBgmAudio() {
+  const key = getBgmCacheKey();
+  const cached = bgmAudioCache.get(key);
+  if (cached && cached.buffer && cached.buffer.length > 0) {
+    console.log(`[BGM] Cache hit: ${cached.fileName}, bytes=${cached.buffer.length}`);
+    return cached.buffer;
+  }
+  console.log(`[BGM] Cache miss: thinking-bgm-${BGM_VERSION}.ulaw`);
+  return null;
+}
+
+async function loadPreGeneratedThinkingBgmAudio() {
+  try {
+    const fileName = `thinking-bgm-${BGM_VERSION}.ulaw`;
+    const file = bucket.file(fileName);
+    const [exists] = await file.exists();
+    if (!exists) {
+      console.log(`[BGM] Pre-generated BGM not found: ${fileName}`);
+      return null;
+    }
+    console.log(`[BGM] Loading pre-generated BGM: ${fileName}`);
+    const [buffer] = await file.download();
+    bgmAudioCache.set(getBgmCacheKey(), { buffer, loadedAt: Date.now(), fileName });
+    return buffer;
+  } catch (e) {
+    console.warn(`[BGM] load_failed err=${e.message}`);
+    return null;
+  }
+}
+
+async function savePreGeneratedThinkingBgmAudio(mulawBuffer) {
+  try {
+    const fileName = `thinking-bgm-${BGM_VERSION}.ulaw`;
+    const file = bucket.file(fileName);
+    await file.save(mulawBuffer, {
+      contentType: "audio/basic",
+      metadata: { cacheControl: "public, max-age=31536000" },
+    });
+    console.log(`[BGM] Saved pre-generated BGM: ${fileName}`);
+    bgmAudioCache.set(getBgmCacheKey(), { buffer: mulawBuffer, loadedAt: Date.now(), fileName });
+  } catch (e) {
+    console.warn(`[BGM] save_failed err=${e.message}`);
+  }
+}
+
+async function generateThinkingBgmMulawBuffer(callSid) {
+  // 外部音源に依存せず、FFmpegで簡易の保留音（トーン＋トレモロ）を生成する
+  const t0 = Date.now();
+  const durSec = Number(process.env.BGM_DURATION_SEC || "6");
+  const freq = Number(process.env.BGM_FREQ || "523.25"); // C5
+  const volume = Number(process.env.BGM_VOLUME || "0.12");
+
+  const input = `sine=frequency=${freq}:duration=${durSec}`;
+  const ts = Date.now();
+  const outputFile = `/tmp/thinking_bgm_${ts}.ulaw`;
+  // fade in/out を入れて「ブツッ」を避ける
+  const ffmpegCommand =
+    `ffmpeg -hide_banner -loglevel error -f lavfi -i "${input}" ` +
+    `-af "tremolo=f=5:d=0.7,volume=${volume},afade=t=in:st=0:d=0.05,afade=t=out:st=${Math.max(0, durSec - 0.05)}:d=0.05" ` +
+    `-ar 8000 -ac 1 -f mulaw ${outputFile} -y`;
+  console.log(`[BGM] Generating thinking BGM call=${callSid} dur=${durSec}s freq=${freq} cmd=${ffmpegCommand}`);
+  await execAsync(ffmpegCommand);
+  const mulawBuffer = fs.readFileSync(outputFile);
+  if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
+  console.log(`[BGM] Generated thinking BGM call=${callSid} bytes=${mulawBuffer.length} total=${Date.now() - t0}ms`);
+  return mulawBuffer;
+}
+
+async function ensureThinkingBgmBuffer(session) {
+  let buf = getCachedThinkingBgmAudio();
+  if (buf) return buf;
+  buf = await loadPreGeneratedThinkingBgmAudio();
+  if (buf) return buf;
+  buf = await generateThinkingBgmMulawBuffer(session?.callSid || "unknown");
+  if (buf && buf.length) {
+    bgmAudioCache.set(getBgmCacheKey(), { buffer: buf, loadedAt: Date.now(), fileName: `thinking-bgm-${BGM_VERSION}.ulaw` });
+    savePreGeneratedThinkingBgmAudio(buf).catch(() => {});
+  }
+  return buf;
+}
+
+async function startThinkingBgmLoop(session, reason) {
+  try {
+    if (!session || !session.callSid) return;
+    // 既にループ中なら何もしない
+    if (session._bgmLoopRunning) return;
+    session._bgmWanted = true;
+    session._bgmLoopRunning = true;
+
+    const buf = await ensureThinkingBgmBuffer(session);
+    if (!buf || !buf.length) {
+      session._bgmLoopRunning = false;
+      return;
+    }
+
+    console.log(`[BGM] start_loop call=${session.callSid} reason=${reason || "n/a"} bytes=${buf.length}`);
+    while (session._bgmWanted) {
+      // 他の音声（相槌/挨拶/返答）が送信中なら待つ
+      if (session.isSendingAudio) {
+        await sleepMs(40);
+        continue;
+      }
+      const ok = await sendAudioViaWebSocket(session, buf, { label: "bgm" });
+      if (!ok) {
+        // 中断（barge-in / 返答開始等）
+        await sleepMs(10);
+      }
+      const gap = Number(process.env.BGM_LOOP_GAP_MS || "0");
+      if (gap > 0) await sleepMs(gap);
+    }
+    console.log(`[BGM] stop_loop call=${session.callSid}`);
+  } catch (e) {
+    console.warn(`[BGM] loop_error call=${session?.callSid || "unknown"} err=${e.message}`);
+  } finally {
+    try {
+      if (session) session._bgmLoopRunning = false;
+    } catch (_) {}
+  }
 }
 
 function queueOrMergeIncomingSegment(session, combinedAudio) {
@@ -594,10 +727,20 @@ async function stopOngoingAudio(session, reason) {
 async function maybePlayFillerAizuchi(session) {
   try {
     if (!session || !session.callSid) return;
-    // どのような会話でも、毎ターン必ず相槌から始める（ユーザー要望）
+    // 要件:
+    // - 1回目: 相槌（音声）→ 思考中はBGMを流し続ける（返答開始で停止）
+    // - 2回目以降: 相槌はBGMのみ（音声相槌は流さない）
     // ただし、送信中の音声がある場合は先に停止して切り替える
     if (session.isSendingAudio) {
       await stopOngoingAudio(session, "before_filler");
+    }
+
+    const turn = Number(session._turnCount || 1);
+    session._bgmWanted = true;
+    if (turn >= 2) {
+      // 相槌は音楽のみ
+      startThinkingBgmLoop(session, `turn_${turn}_aizuchi_bgm_only`).catch(() => {});
+      return;
     }
 
     const ttsEngine = session._ttsEngineForCall || "openai";
@@ -630,6 +773,10 @@ async function maybePlayFillerAizuchi(session) {
     session._audioSendPromise = p;
     p.finally(() => {
       session._fillerActive = false;
+      // 相槌（音声）の後、返答開始までBGMを流す
+      if (session._bgmWanted) {
+        startThinkingBgmLoop(session, `after_filler_turn_${turn}`).catch(() => {});
+      }
     });
   } catch (e) {
     console.error(`[FILLER] Error: ${e.message}`);
@@ -756,6 +903,8 @@ async function handleInboundMediaMessage(session, message) {
       console.log(`[WS] Caller speech detected while audio playing call=${callSid}`);
       requestStopAudio(session, "caller_speech");
     }
+    // BGM/相槌中でも発話が始まったら「思考中BGM」は止める（＝ユーザーの発話を優先）
+    session._bgmWanted = false;
 
     // 直前のeos確定後に“処理待ち”がある場合はキャンセルして、次のeosまで結合する
     if (session._pendingProcessTimer) {
@@ -808,6 +957,8 @@ async function handleInboundMediaMessage(session, message) {
         console.log(`[LAT] segment_drop call=${callSid} reason=too_small frames=${kept.length}/${minFrames} bytes=${combined.length}/${minBytes} ms=${speechMs}/${minMs}`);
         return;
       }
+      session._turnCount = (session._turnCount || 0) + 1;
+      session._lastEosConfirmedMs = now;
       await maybePlayFillerAizuchi(session);
       // 相槌中の“割り込み”を拾って前後を結合できるよう、少し待ってから処理する
       queueOrMergeIncomingSegment(session, combined);
@@ -1925,6 +2076,8 @@ async function sendAudioResponseViaMediaStream(session, text) {
     
     // WebSocket経由で音声を送信
     // 相槌などが再生中の場合はここで停止して切り替える（ただし初期挨拶は中断しない）
+    // 返答が始まるので「思考中BGM」は不要
+    session._bgmWanted = false;
     await stopOngoingAudio(session, "new_ai_response");
     const tWsSend = Date.now();
     const isGreeting = (text === "お電話ありがとうございます。テックファンドです。");
