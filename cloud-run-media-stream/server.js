@@ -940,80 +940,83 @@ async function sendAudioViaWebSocket(session, mulawBuffer) {
     let sentChunks = 0;
     let wasInterrupted = false;
   
-    // 音声データをバイナリチャンクに分割して送信
-    // setTimeout(20) の誤差で「ブツブツ」しやすいので、目標時刻に合わせてドリフト補正する
-    const tPacing0 = Date.now();
-    for (let i = 0; i < totalChunks; i++) {
-      // 中断フラグをチェック（この送信世代に対する停止要求のみ）
-      if (session._stopAudioGen === gen) {
-        console.log(`[WS-AUDIO] Audio sending interrupted for call ${session.callSid} at chunk ${i}/${totalChunks}`);
-        wasInterrupted = true;
-        break;
-      }
+    try {
+      // 音声データをバイナリチャンクに分割して送信
+      // setTimeout(20) の誤差で「ブツブツ」しやすいので、目標時刻に合わせてドリフト補正する
+      const tPacing0 = Date.now();
+      for (let i = 0; i < totalChunks; i++) {
+        // 中断フラグをチェック（この送信世代に対する停止要求のみ）
+        if (session._stopAudioGen === gen) {
+          console.log(`[WS-AUDIO] Audio sending interrupted for call ${session.callSid} at chunk ${i}/${totalChunks}`);
+          wasInterrupted = true;
+          break;
+        }
   
-      const start = i * chunkSize;
-      const end = Math.min(start + chunkSize, mulawBuffer.length);
-      const chunk = mulawBuffer.slice(start, end);
-      
-      // 各チャンクをbase64エンコード
-      const base64Payload = chunk.toString("base64");
+        const start = i * chunkSize;
+        const end = Math.min(start + chunkSize, mulawBuffer.length);
+        const chunk = mulawBuffer.slice(start, end);
+        
+        // 各チャンクをbase64エンコード
+        const base64Payload = chunk.toString("base64");
   
-      const mediaMessage = {
-        event: "media",
-        streamSid: streamSid,
-        media: {
-          payload: base64Payload,
-        },
-      };
+        const mediaMessage = {
+          event: "media",
+          streamSid: streamSid,
+          media: {
+            payload: base64Payload,
+          },
+        };
   
-      session.ws.send(JSON.stringify(mediaMessage));
-      sentChunks++;
-      if (i === 0) {
-        const now = Date.now();
-        const sinceStartEvt = session._startEventMs ? (now - session._startEventMs) : null;
-        const sinceEos = session._lastEosConfirmedMs ? (now - session._lastEosConfirmedMs) : null;
-        console.log(`[LAT] ws_first_chunk call=${session.callSid} label=${label} sinceStartEventMs=${sinceStartEvt} sinceEosMs=${sinceEos} t=${now}`);
-      }
-      
-      // 送信レートを制御（20msごとに送信 / ドリフト補正）
-      if (i < totalChunks - 1) {
-        const target = tPacing0 + (i + 1) * 20;
-        const delay = target - Date.now();
-        if (delay > 0) {
-          await new Promise(resolve => setTimeout(resolve, delay));
+        session.ws.send(JSON.stringify(mediaMessage));
+        sentChunks++;
+        if (i === 0) {
+          const now = Date.now();
+          const sinceStartEvt = session._startEventMs ? (now - session._startEventMs) : null;
+          const sinceEos = session._lastEosConfirmedMs ? (now - session._lastEosConfirmedMs) : null;
+          console.log(`[LAT] ws_first_chunk call=${session.callSid} label=${label} sinceStartEventMs=${sinceStartEvt} sinceEosMs=${sinceEos} t=${now}`);
+        }
+        
+        // 送信レートを制御（20msごとに送信 / ドリフト補正）
+        if (i < totalChunks - 1) {
+          const target = tPacing0 + (i + 1) * 20;
+          const delay = target - Date.now();
+          if (delay > 0) {
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
         }
       }
-    }
   
-    // 音声送信完了フラグをリセット（この送信世代のみ）
-    if (session._activeAudioGen === gen) {
-      session.isSendingAudio = false;
-      if (session._stopAudioGen === gen) session._stopAudioGen = null;
-      if (session._uninterruptibleAudioGen === gen) session._uninterruptibleAudioGen = null;
-    }
-    if (opts && opts.label === "greeting") {
-      session._greetingInProgress = false;
-    }
+      if (!wasInterrupted) {
+        // 音声送信完了後、markメッセージを送信して再生完了を追跡
+        const markName = `audio_${Date.now()}`;
+        const markMessage = {
+          event: "mark",
+          streamSid: streamSid,
+          mark: {
+            name: markName,
+          },
+        };
   
-    if (!wasInterrupted) {
-      // 音声送信完了後、markメッセージを送信して再生完了を追跡
-      const markName = `audio_${Date.now()}`;
-      const markMessage = {
-        event: "mark",
-        streamSid: streamSid,
-        mark: {
-          name: markName,
-        },
-      };
+        session.ws.send(JSON.stringify(markMessage));
+        console.log(`[WS-AUDIO] Mark message sent: ${markName} for call ${session.callSid}`);
+      } else {
+        console.log(`[WS-AUDIO] Audio sending stopped early (${sentChunks}/${totalChunks} chunks sent) for call ${session.callSid}`);
+      }
   
-      session.ws.send(JSON.stringify(markMessage));
-      console.log(`[WS-AUDIO] Mark message sent: ${markName} for call ${session.callSid}`);
-    } else {
-      console.log(`[WS-AUDIO] Audio sending stopped early (${sentChunks}/${totalChunks} chunks sent) for call ${session.callSid}`);
+      console.log(`[LAT] ws_send_complete call=${session.callSid} label=${label} sentChunks=${sentChunks}/${totalChunks} dt=${Date.now() - tStartSend}ms`);
+      return !wasInterrupted;
+    } finally {
+      // 例外/切断/中断でも、isSendingAudio が残るとVADが常に「再生中扱い」になり、
+      // 後半ほど相槌が早発する原因になるため必ずクリアする（この送信世代のみ）
+      if (session._activeAudioGen === gen) {
+        session.isSendingAudio = false;
+        if (session._stopAudioGen === gen) session._stopAudioGen = null;
+        if (session._uninterruptibleAudioGen === gen) session._uninterruptibleAudioGen = null;
+      }
+      if (opts && opts.label === "greeting" && session._activeAudioGen === gen) {
+        session._greetingInProgress = false;
+      }
     }
-  
-    console.log(`[LAT] ws_send_complete call=${session.callSid} label=${label} sentChunks=${sentChunks}/${totalChunks} dt=${Date.now() - tStartSend}ms`);
-    return !wasInterrupted;
   })();
 
   session._audioSendPromise = sendPromise;
