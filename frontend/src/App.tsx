@@ -93,7 +93,7 @@ export default function App() {
             </span>
           ) : (
             <span className="muted">
-              project: {cfg.projectId} <span className="mono">· v{APP_VERSION}</span>
+              project: {cfg.projectId} <span className="mono">· {APP_VERSION}</span>
             </span>
           )}
         </div>

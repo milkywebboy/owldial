@@ -22,9 +22,8 @@ function formatDate(d) {
 }
 
 function main() {
-  const sha = getGitSha();
   const date = formatDate(new Date());
-  const version = `${date}+${sha}`;
+  const version = `v${date}`;
 
   const outPath = path.join(__dirname, "..", "src", "version.ts");
   const content =
@@ -41,5 +40,6 @@ function main() {
 }
 
 main();
+
 
 
