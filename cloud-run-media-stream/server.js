@@ -9,6 +9,7 @@ const { initializeApp, cert } = require("firebase-admin/app");
 const { getFirestore, Timestamp } = require("firebase-admin/firestore");
 const { Storage } = require("@google-cloud/storage");
 const { TextToSpeechClient } = require("@google-cloud/text-to-speech");
+const { SpeechClient } = require("@google-cloud/speech");
 const { OpenAI } = require("openai");
 const twilio = require("twilio");
 
@@ -16,7 +17,7 @@ const app = express();
 const server = http.createServer(app);
 
 // Firebase初期化
-let db, bucket, ttsClient, openai;
+let db, bucket, ttsClient, speechClient, openai;
 
 function getOpenAIApiKey() {
   // Cloud Run Secret/環境変数に末尾改行が混入することがあり、
@@ -42,6 +43,7 @@ try {
   const storage = new Storage();
   bucket = storage.bucket(process.env.AUDIO_BUCKET || "owldial-tts");
   ttsClient = new TextToSpeechClient();
+  speechClient = new SpeechClient();
   openai = new OpenAI({ apiKey: getOpenAIApiKey() });
   
   console.log("Firebase services initialized successfully");
@@ -57,6 +59,7 @@ try {
     const storage = new Storage();
     bucket = storage.bucket(process.env.AUDIO_BUCKET || "owldial-tts");
     ttsClient = new TextToSpeechClient();
+    speechClient = new SpeechClient();
     openai = new OpenAI({ apiKey: getOpenAIApiKey() });
     console.log("Firebase initialized with fallback");
   } catch (fallbackError) {
@@ -68,10 +71,167 @@ try {
         ttsClient = new TextToSpeechClient();
         console.log("TTS client initialized in fallback");
       }
+      if (!speechClient) {
+        speechClient = new SpeechClient();
+        console.log("Speech client initialized in fallback");
+      }
     } catch (ttsError) {
       console.error("TTS client initialization error:", ttsError);
     }
   }
+}
+
+function getSttProvider() {
+  // "google" | "openai"
+  return (process.env.STT_PROVIDER || "openai").toLowerCase();
+}
+
+async function transcribeWithGoogleSpeechMulaw(callSid, mulawBuffer) {
+  const t0 = Date.now();
+  if (!speechClient) {
+    throw new Error("Speech client not initialized");
+  }
+  const request = {
+    config: {
+      encoding: "MULAW",
+      sampleRateHertz: 8000,
+      languageCode: "ja-JP",
+      enableAutomaticPunctuation: true,
+      // 電話音声向け（利用できない場合はAPI側で無視/エラーになる可能性があるのでtry/catchで吸収）
+      model: process.env.GOOGLE_STT_MODEL || "phone_call",
+      useEnhanced: String(process.env.GOOGLE_STT_USE_ENHANCED || "true").toLowerCase() === "true",
+    },
+    audio: {
+      content: mulawBuffer.toString("base64"),
+    },
+  };
+  try {
+    const [resp] = await speechClient.recognize(request);
+    const results = resp.results || [];
+    const transcript = results
+      .map((r) => r.alternatives?.[0]?.transcript || "")
+      .join(" ")
+      .trim();
+    const confidence = results?.[0]?.alternatives?.[0]?.confidence;
+    console.log(
+      `[STT] google_done call=${callSid} dt=${Date.now() - t0}ms chars=${transcript.length} conf=${typeof confidence === "number" ? confidence.toFixed(3) : "n/a"}`
+    );
+    return transcript;
+  } catch (e) {
+    // phone_call/enhancedが使えない場合は素の設定でリトライ
+    console.warn(`[STT] google_failed_primary call=${callSid} err=${e.message}`);
+    const fallbackReq = {
+      config: {
+        encoding: "MULAW",
+        sampleRateHertz: 8000,
+        languageCode: "ja-JP",
+        enableAutomaticPunctuation: true,
+      },
+      audio: { content: mulawBuffer.toString("base64") },
+    };
+    const [resp2] = await speechClient.recognize(fallbackReq);
+    const results2 = resp2.results || [];
+    const transcript2 = results2
+      .map((r) => r.alternatives?.[0]?.transcript || "")
+      .join(" ")
+      .trim();
+    console.log(`[STT] google_done_fallback call=${callSid} dt=${Date.now() - t0}ms chars=${transcript2.length}`);
+    return transcript2;
+  }
+}
+
+function shouldEnableRealtimeStt() {
+  // googleを選んだらデフォルトON（止めたい場合は DISABLE_REALTIME_STT=true）
+  if (String(process.env.DISABLE_REALTIME_STT || "").toLowerCase() === "true") return false;
+  return getSttProvider() === "google";
+}
+
+function scheduleRealtimeTranscriptFlush(session) {
+  if (!session || !session.callSid) return;
+  if (session._rtFlushTimer) return;
+  session._rtFlushTimer = setTimeout(async () => {
+    session._rtFlushTimer = null;
+    try {
+      const callRef = db.collection("calls").doc(session.callSid);
+      const text = String(session._rtTranscriptFinal || "");
+      const interim = String(session._rtTranscriptInterim || "");
+      await callRef.set(
+        {
+          callSid: session.callSid,
+          status: session.status || "active",
+          realtimeTranscript: text,
+          realtimeTranscriptInterim: interim,
+          realtimeTranscriptUpdatedAt: Timestamp.now(),
+        },
+        { merge: true }
+      );
+    } catch (e) {
+      console.warn(`[RT-STT] flush_failed call=${session.callSid} err=${e.message}`);
+    }
+  }, Number(process.env.RT_TRANSCRIPT_FLUSH_MS || "500"));
+}
+
+function startRealtimeGoogleSttIfNeeded(session) {
+  try {
+    if (!session || !session.callSid) return;
+    if (!shouldEnableRealtimeStt()) return;
+    if (!speechClient) return;
+    if (session._rtSttStream) return;
+
+    const request = {
+      config: {
+        encoding: "MULAW",
+        sampleRateHertz: 8000,
+        languageCode: "ja-JP",
+        enableAutomaticPunctuation: true,
+        interimResults: true,
+      },
+      interimResults: true,
+    };
+
+    session._rtTranscriptFinal = session._rtTranscriptFinal || "";
+    session._rtTranscriptInterim = session._rtTranscriptInterim || "";
+
+    const stream = speechClient.streamingRecognize(request)
+      .on("error", (e) => {
+        console.warn(`[RT-STT] stream_error call=${session.callSid} err=${e.message}`);
+        try {
+          session._rtSttStream = null;
+        } catch (_) {}
+      })
+      .on("data", (data) => {
+        try {
+          const r = data.results?.[0];
+          const alt = r?.alternatives?.[0];
+          const txt = (alt?.transcript || "").trim();
+          if (!txt) return;
+          if (r.isFinal) {
+            session._rtTranscriptFinal = (session._rtTranscriptFinal ? session._rtTranscriptFinal + "\n" : "") + txt;
+            session._rtTranscriptInterim = "";
+          } else {
+            session._rtTranscriptInterim = txt;
+          }
+          scheduleRealtimeTranscriptFlush(session);
+        } catch (_) {}
+      });
+
+    session._rtSttStream = stream;
+    console.log(`[RT-STT] stream_started call=${session.callSid}`);
+  } catch (e) {
+    console.warn(`[RT-STT] start_failed call=${session?.callSid || "unknown"} err=${e.message}`);
+  }
+}
+
+function writeRealtimeSttAudio(session, mulawChunk) {
+  try {
+    if (!session || !mulawChunk || !mulawChunk.length) return;
+    if (!session.callSid) return;
+    if (!shouldEnableRealtimeStt()) return;
+    startRealtimeGoogleSttIfNeeded(session);
+    if (session._rtSttStream) {
+      session._rtSttStream.write(mulawChunk);
+    }
+  } catch (_) {}
 }
 
 const activeSessions = new Map();
@@ -395,11 +555,7 @@ async function handleInboundMediaMessage(session, message) {
   // 念のため：inbound以外（outbound/both等）は転写・VAD対象から除外
   if (track && track !== "inbound") return;
 
-  // 初期挨拶の再生中は、誤検知（挨拶の回り込み等）を避けるためVAD/転写を一旦無視する
-  // 要件: 初期挨拶は相手が話し始めても中止せず最後まで再生する
-  if (session._greetingInProgress) {
-    return;
-  }
+  if (!payload) return;
 
   // mediaイベントが受信された時点で、startイベントがまだ受信されていない場合、
   // streamSidをmediaイベントから取得して初期メッセージを送信する
@@ -451,13 +607,22 @@ async function handleInboundMediaMessage(session, message) {
     }
   }
 
-  if (!payload) return;
-
   const callSid = session.callSid || "unknown";
   const now = Date.now();
 
   // base64デコードしてmu-lawデータを取得
   const audioData = Buffer.from(payload, "base64");
+
+  // リアルタイム文字起こし用に常時投入（VAD/挨拶中の抑制とは独立）
+  if (session.callSid) {
+    writeRealtimeSttAudio(session, audioData);
+  }
+
+  // 初期挨拶の再生中は、誤検知（挨拶の回り込み等）を避けるためVAD/転写を一旦無視する
+  // 要件: 初期挨拶は相手が話し始めても中止せず最後まで再生する
+  if (session._greetingInProgress) {
+    return;
+  }
 
   // 音声レベルを計算（0..100）
   const audioLevel = calculateAudioLevel(audioData);
@@ -838,90 +1003,95 @@ async function processIncomingAudio(session, combinedAudioOverride) {
         continue;
       }
     
-    // mu-law形式の音声をWAV形式に変換（Whisper用）
-    const timestamp = Date.now();
-    const inputFile = `/tmp/incoming_${timestamp}.ulaw`;
-    const outputFile = `/tmp/incoming_${timestamp}.wav`;
-    
-    fs.writeFileSync(inputFile, combinedAudio);
-    
-    // FFmpegでmu-lawをWAVに変換
-    // 小声/こもり声をWhisperが拾いやすいよう、簡易の帯域フィルタ＋ゲインを適用してWAVへ
-    // （過剰な正規化は遅延増につながるため、軽量なフィルタに留める）
-    const whisperGainDb = Number(process.env.WHISPER_GAIN_DB || "6"); // dB
-    const whisperFilters = process.env.WHISPER_AUDIO_FILTERS
-      || `highpass=f=120,lowpass=f=3800,volume=${whisperGainDb}dB`;
-    const ffmpegCommand = `ffmpeg -f mulaw -ar 8000 -ac 1 -i ${inputFile} -af '${whisperFilters}' -ar 16000 -ac 1 -f wav ${outputFile} -y`;
-    const tFfmpeg1 = Date.now();
-    await execAsync(ffmpegCommand);
-    console.log(`[LAT] ffmpeg_ulaw_to_wav call=${callSid} dt=${Date.now() - tFfmpeg1}ms total=${Date.now() - t0}ms`);
-    
-    const wavBuffer = fs.readFileSync(outputFile);
-    console.log(`[LAT] wav_read call=${callSid} bytes=${wavBuffer.length} total=${Date.now() - t0}ms`);
-    
-    // 一時ファイルを削除
-    if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
-    if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
-    
-    // Whisperで転写（OpenAI SDKを使用）
-    const FormData = require("form-data");
-    const formData = new FormData();
-    formData.append("file", wavBuffer, {
-      filename: "audio.wav",
-      contentType: "audio/wav",
-    });
-    formData.append("model", "whisper-1");
-    formData.append("language", "ja");
-    // 返却フォーマット（デバッグしやすいようverbose）
-    formData.append("response_format", "verbose_json");
-    // 低めの温度で安定化
-    formData.append("temperature", "0");
-    
-    // OpenAI APIに直接リクエストを送信
-    const https = require("https");
-    const transcriptionPromise = new Promise((resolve, reject) => {
-      const req = https.request({
-        hostname: "api.openai.com",
-        path: "/v1/audio/transcriptions",
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${getOpenAIApiKey()}`,
-          ...formData.getHeaders(),
-        },
-      }, (res) => {
-        let data = "";
-        res.on("data", (chunk) => {
-          data += chunk;
+    // STT: Google / OpenAI(Whisper) 切替
+    let userMessage = "";
+    const sttProvider = getSttProvider();
+    if (sttProvider === "google") {
+      const tStt = Date.now();
+      userMessage = (await transcribeWithGoogleSpeechMulaw(callSid, combinedAudio)).trim();
+      console.log(`[LAT] stt_done call=${callSid} provider=google dt=${Date.now() - tStt}ms total=${Date.now() - t0}ms chars=${userMessage.length}`);
+      console.log(`[AUDIO-IN] Transcription(Google) call=${callSid}: ${userMessage}`);
+    } else {
+      // Whisper用にmu-law形式の音声をWAV形式に変換
+      const timestamp = Date.now();
+      const inputFile = `/tmp/incoming_${timestamp}.ulaw`;
+      const outputFile = `/tmp/incoming_${timestamp}.wav`;
+      
+      fs.writeFileSync(inputFile, combinedAudio);
+      
+      // 小声/こもり声をWhisperが拾いやすいよう、簡易の帯域フィルタ＋ゲインを適用してWAVへ
+      const whisperGainDb = Number(process.env.WHISPER_GAIN_DB || "6"); // dB
+      const whisperFilters = process.env.WHISPER_AUDIO_FILTERS
+        || `highpass=f=120,lowpass=f=3800,volume=${whisperGainDb}dB`;
+      const ffmpegCommand = `ffmpeg -f mulaw -ar 8000 -ac 1 -i ${inputFile} -af '${whisperFilters}' -ar 16000 -ac 1 -f wav ${outputFile} -y`;
+      const tFfmpeg1 = Date.now();
+      await execAsync(ffmpegCommand);
+      console.log(`[LAT] ffmpeg_ulaw_to_wav call=${callSid} dt=${Date.now() - tFfmpeg1}ms total=${Date.now() - t0}ms`);
+      
+      const wavBuffer = fs.readFileSync(outputFile);
+      console.log(`[LAT] wav_read call=${callSid} bytes=${wavBuffer.length} total=${Date.now() - t0}ms`);
+      
+      // 一時ファイルを削除
+      if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
+      if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
+      
+      // Whisperで転写（OpenAI APIに直接リクエスト）
+      const FormData = require("form-data");
+      const formData = new FormData();
+      formData.append("file", wavBuffer, {
+        filename: "audio.wav",
+        contentType: "audio/wav",
+      });
+      formData.append("model", "whisper-1");
+      formData.append("language", "ja");
+      formData.append("response_format", "verbose_json");
+      formData.append("temperature", "0");
+      
+      const https = require("https");
+      const transcriptionPromise = new Promise((resolve, reject) => {
+        const req = https.request({
+          hostname: "api.openai.com",
+          path: "/v1/audio/transcriptions",
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${getOpenAIApiKey()}`,
+            ...formData.getHeaders(),
+          },
+        }, (res) => {
+          let data = "";
+          res.on("data", (chunk) => {
+            data += chunk;
+          });
+          res.on("end", () => {
+            try {
+              const result = JSON.parse(data);
+              resolve({
+                statusCode: res.statusCode,
+                text: result.text || "",
+                language: result.language,
+                error: result.error,
+              });
+            } catch (error) {
+              reject(error);
+            }
+          });
         });
-        res.on("end", () => {
-          try {
-            const result = JSON.parse(data);
-            resolve({
-              statusCode: res.statusCode,
-              text: result.text || "",
-              language: result.language,
-              error: result.error,
-            });
-          } catch (error) {
-            reject(error);
-          }
-        });
+        
+        req.on("error", reject);
+        formData.pipe(req);
       });
       
-      req.on("error", reject);
-      formData.pipe(req);
-    });
-    
-    const tWhisper = Date.now();
-    const whisperResult = await transcriptionPromise;
-    const userMessage = (whisperResult.text || "").trim();
-    console.log(`[LAT] whisper_done call=${callSid} dt=${Date.now() - tWhisper}ms total=${Date.now() - t0}ms chars=${userMessage.length}`);
-    console.log(`[AUDIO-IN] Whisper meta call=${callSid}: status=${whisperResult.statusCode} lang=${whisperResult.language || "n/a"} hasError=${whisperResult.error ? "yes" : "no"}`);
-    console.log(`[AUDIO-IN] Transcription for call ${callSid}: ${userMessage}`);
+      const tWhisper = Date.now();
+      const whisperResult = await transcriptionPromise;
+      userMessage = (whisperResult.text || "").trim();
+      console.log(`[LAT] whisper_done call=${callSid} dt=${Date.now() - tWhisper}ms total=${Date.now() - t0}ms chars=${userMessage.length}`);
+      console.log(`[AUDIO-IN] Whisper meta call=${callSid}: status=${whisperResult.statusCode} lang=${whisperResult.language || "n/a"} hasError=${whisperResult.error ? "yes" : "no"}`);
+      console.log(`[AUDIO-IN] Transcription(Whisper) call=${callSid}: ${userMessage}`);
+    }
 
     // 空転写/エラーは会話履歴に入れず、再度話してもらう
     if (!userMessage) {
-      console.warn(`[AUDIO-IN] Empty transcription (status=${whisperResult.statusCode}) for call ${callSid}`);
+      console.warn(`[AUDIO-IN] Empty transcription for call ${callSid}`);
       await sendAudioResponseViaMediaStream(session, "すみません、少し聞き取れませんでした。もう一度お願いできますか？");
       continue;
     }

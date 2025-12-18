@@ -29,6 +29,9 @@ type CallDoc = {
   conversations?: Conversation[];
   purposeCaptured?: boolean;
   purposeMessage?: string;
+  realtimeTranscript?: string;
+  realtimeTranscriptInterim?: string;
+  realtimeTranscriptUpdatedAt?: Timestamp;
 };
 
 export default function App() {
@@ -173,6 +176,25 @@ export default function App() {
                     <div className="empty">会話ログがまだありません</div>
                   ) : null}
                 </div>
+
+              {selected.data.realtimeTranscript || selected.data.realtimeTranscriptInterim ? (
+                <>
+                  <div className="panelDivider" />
+                  <div className="panelTitle">リアルタイム文字起こし</div>
+                  {selected.data.realtimeTranscript ? (
+                    <div className="msg user">
+                      <div className="msgRole">user (rt final)</div>
+                      <div className="msgText">{selected.data.realtimeTranscript}</div>
+                    </div>
+                  ) : null}
+                  {selected.data.realtimeTranscriptInterim ? (
+                    <div className="msg user">
+                      <div className="msgRole">user (rt interim)</div>
+                      <div className="msgText">{selected.data.realtimeTranscriptInterim}</div>
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
               </div>
             )}
           </section>
