@@ -338,7 +338,7 @@ const FILLER_VERSION = process.env.FILLER_VERSION || "v3";
 // 思考中BGM（保留音）のメモリキャッシュ（Cloud Runインスタンス内）
 // key: `${BGM_VERSION}`
 const bgmAudioCache = new Map();
-const BGM_VERSION = process.env.BGM_VERSION || "v1";
+const BGM_VERSION = process.env.BGM_VERSION || "v2";
 
 // 相槌（待ち）固定テキスト
 const FILLER_TEXT_THINKING = "はい、ありがとうございます。AIが思考中ですので少々お待ちください";
@@ -462,21 +462,56 @@ async function savePreGeneratedThinkingBgmAudio(mulawBuffer) {
 }
 
 async function generateThinkingBgmMulawBuffer(callSid) {
-  // 外部音源に依存せず、FFmpegで簡易の保留音（トーン＋トレモロ）を生成する
+  // 外部音源に依存せず、FFmpegで簡易の保留音を生成する
+  // 既定は「ハープっぽい」アルペジオ（短い減衰音＋軽い残響）
   const t0 = Date.now();
   const durSec = Number(process.env.BGM_DURATION_SEC || "6");
-  const freq = Number(process.env.BGM_FREQ || "523.25"); // C5
   const volume = Number(process.env.BGM_VOLUME || "0.12");
+  const style = String(process.env.BGM_STYLE || "harp").toLowerCase();
 
-  const input = `sine=frequency=${freq}:duration=${durSec}`;
   const ts = Date.now();
   const outputFile = `/tmp/thinking_bgm_${ts}.ulaw`;
-  // fade in/out を入れて「ブツッ」を避ける
-  const ffmpegCommand =
-    `ffmpeg -hide_banner -loglevel error -f lavfi -i "${input}" ` +
-    `-af "tremolo=f=5:d=0.7,volume=${volume},afade=t=in:st=0:d=0.05,afade=t=out:st=${Math.max(0, durSec - 0.05)}:d=0.05" ` +
-    `-ar 8000 -ac 1 -f mulaw ${outputFile} -y`;
-  console.log(`[BGM] Generating thinking BGM call=${callSid} dur=${durSec}s freq=${freq} cmd=${ffmpegCommand}`);
+  let ffmpegCommand = "";
+  if (style === "tone") {
+    const freq = Number(process.env.BGM_FREQ || "523.25"); // C5
+    const input = `sine=frequency=${freq}:duration=${durSec}`;
+    // fade in/out を入れて「ブツッ」を避ける
+    ffmpegCommand =
+      `ffmpeg -hide_banner -loglevel error -f lavfi -i "${input}" ` +
+      `-af "tremolo=f=5:d=0.7,volume=${volume},afade=t=in:st=0:d=0.05,afade=t=out:st=${Math.max(0, durSec - 0.05)}:d=0.05" ` +
+      `-ar 8000 -ac 1 -f mulaw ${outputFile} -y`;
+  } else {
+    // Harp-ish arpeggio:
+    // exponential decay per note + slight echo (reverb-ish) to simulate plucked strings.
+    const noteDur = Number(process.env.BGM_NOTE_DUR_SEC || "0.40");
+    const notes = [
+      523.25, 659.25, 783.99, 1046.50, // C5 E5 G5 C6
+      783.99, 659.25, 523.25, 659.25,  // down/up
+      587.33, 739.99, 880.00, 1174.66, // D5 F#5 A5 D6
+      880.00, 739.99, 587.33,          // tail
+    ];
+    const n = Math.max(1, Math.floor(durSec / noteDur));
+    const freqs = [];
+    for (let i = 0; i < n; i++) freqs.push(notes[i % notes.length]);
+
+    // Build: multiple inputs, concat, then echo + filters.
+    const inputs = freqs
+      .map((f) => `-f lavfi -i "aevalsrc=${volume}*sin(2*PI*${f}*t)*exp(-10*t):d=${noteDur}"`)
+      .join(" ");
+    const labels = freqs.map((_, i) => `[${i}:a]`).join("");
+    const fadeOutStart = Math.max(0, (n * noteDur) - 0.08);
+    const filter =
+      `${labels}concat=n=${freqs.length}:v=0:a=1,` +
+      // light echo for harp resonance (keep subtle to avoid muddiness on phone audio)
+      `aecho=0.8:0.88:55|110:0.25|0.15,` +
+      `highpass=f=120,lowpass=f=3200,` +
+      `afade=t=in:st=0:d=0.02,afade=t=out:st=${fadeOutStart}:d=0.08`;
+    ffmpegCommand =
+      `ffmpeg -hide_banner -loglevel error ${inputs} ` +
+      `-filter_complex "${filter}" ` +
+      `-ar 8000 -ac 1 -f mulaw ${outputFile} -y`;
+  }
+  console.log(`[BGM] Generating thinking BGM call=${callSid} style=${style} dur=${durSec}s cmd=${ffmpegCommand}`);
   await execAsync(ffmpegCommand);
   const mulawBuffer = fs.readFileSync(outputFile);
   if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
