@@ -205,6 +205,29 @@ async function appendAssistantRealtimeText(session, text, label, addToConversati
   }
 }
 
+function normalizeJapaneseTextForTts(text) {
+  const t0 = String(text || "");
+  if (!t0) return t0;
+  if (process.env.TTS_NORMALIZE_JA === "0") return t0;
+
+  // TTSが読みを崩しやすい単語を、読み（かな）に寄せる
+  // NOTE: 画面表示やログ/Firestore保存用のテキストは変えず、読み上げ入力だけ補正する
+  let t = t0;
+  const replacements = [
+    ["承ります", "うけたまわります"],
+    ["承りました", "うけたまわりました"],
+    ["恐れ入ります", "おそれいります"],
+    ["折り返し先", "おりかえしさき"],
+    ["お繋ぎ", "おつなぎ"],
+    ["おつなぎ", "おつなぎ"], // noop（将来の揺れ対策）
+  ];
+  for (const [from, to] of replacements) {
+    if (from && to) t = t.split(from).join(to);
+  }
+
+  return t;
+}
+
 function startRealtimeGoogleSttIfNeeded(session) {
   try {
     if (!session || !session.callSid) return;
@@ -1800,6 +1823,11 @@ async function sendAudioResponseViaMediaStream(session, text) {
 
     console.log(`[AUDIO] TTS settings for call ${callSid}: engine=${ttsEngine}, voice=${ttsVoice}, speed=${speed}`);
 
+    const ttsText = normalizeJapaneseTextForTts(text);
+    if (ttsText !== text) {
+      console.log(`[AUDIO] TTS text normalized call=${callSid} before="${text}" after="${ttsText}"`);
+    }
+
     let audioBuffer;
 
     if (ttsEngine === "openai") {
@@ -1813,7 +1841,7 @@ async function sendAudioResponseViaMediaStream(session, text) {
       const response = await openai.audio.speech.create({
         model: "gpt-4o-mini-tts-2025-12-15",
         voice: finalVoice,
-        input: text,
+        input: ttsText,
         speed: speed,
       });
       console.log(`[LAT] openai_tts_done call=${callSid} dt=${Date.now() - tTts}ms total=${Date.now() - t0}ms`);
@@ -1833,7 +1861,7 @@ async function sendAudioResponseViaMediaStream(session, text) {
       
       const tTts = Date.now();
       const [response] = await ttsClient.synthesizeSpeech({
-        input: { text: text },
+        input: { text: ttsText },
         voice: {
           languageCode: "ja-JP",
           name: finalVoice,
