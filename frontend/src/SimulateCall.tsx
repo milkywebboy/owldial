@@ -102,12 +102,15 @@ export default function SimulateCall() {
   const wsRef = useRef<WebSocket | null>(null);
   const captureCtxRef = useRef<AudioContext | null>(null);
   const playbackCtxRef = useRef<AudioContext | null>(null);
+  const playbackNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const playbackGainRef = useRef<GainNode | null>(null);
+  const playbackStateRef = useRef<{ buf: Float32Array; pos: number }>({ buf: new Float32Array(0), pos: 0 });
+  const playbackStartedRef = useRef(false);
   const micStreamRef = useRef<MediaStream | null>(null);
   const procNodeRef = useRef<ScriptProcessorNode | null>(null);
   const sendTimerRef = useRef<number | null>(null);
   const sendQueueRef = useRef<Uint8Array>(new Uint8Array(0));
   const resampleRef = useRef<ResampleState>({ buf: new Float32Array(0), pos: 0 });
-  const playAtRef = useRef<number>(0);
 
   const wsUrlAuto = useMemo(() => {
     // Hosting(owldial.web.app) は WebSocket の upgrade を扱えないため、
@@ -159,6 +162,10 @@ export default function SimulateCall() {
           playbackCtxRef.current.close().catch(() => {});
           playbackCtxRef.current = null;
         }
+        playbackNodeRef.current = null;
+        playbackGainRef.current = null;
+        playbackStateRef.current = { buf: new Float32Array(0), pos: 0 };
+        playbackStartedRef.current = false;
       } catch {
         // ignore
       }
@@ -189,8 +196,8 @@ export default function SimulateCall() {
             outboundMulawRef.current.push(bytes);
             setOutboundBytes((x) => x + bytes.length);
             setOutboundChunks((x) => x + 1);
-            // リアルタイム再生
-            playOutboundMulaw(bytes);
+            // リアルタイム再生（ストリーミング）
+            pushOutboundMulawForPlayback(bytes);
           }
         } else if (msg.event === "mark") {
           // ignore
@@ -235,24 +242,66 @@ export default function SimulateCall() {
     if (playbackCtxRef.current) return playbackCtxRef.current;
     const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
     playbackCtxRef.current = ctx;
-    playAtRef.current = 0;
     return ctx;
   }
 
-  function playOutboundMulaw(mulaw: Uint8Array) {
+  function ensurePlaybackStream() {
     const ctx = ensurePlaybackCtx();
-    const pcm = muLawToPcm16(mulaw);
-    const buf = ctx.createBuffer(1, pcm.length, 8000);
-    const ch = buf.getChannelData(0);
-    for (let i = 0; i < pcm.length; i++) ch[i] = Math.max(-1, Math.min(1, pcm[i] / 32768));
+    if (playbackNodeRef.current) return;
 
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.connect(ctx.destination);
-    const now = ctx.currentTime;
-    const startAt = Math.max(playAtRef.current || now, now + 0.05);
-    src.start(startAt);
-    playAtRef.current = startAt + buf.duration;
+    // ScriptProcessorで連続再生（1チャンク=1ソース再生だと「ブツブツ」になりやすい）
+    const node = ctx.createScriptProcessor(4096, 0, 1);
+    playbackNodeRef.current = node;
+    const gain = ctx.createGain();
+    gain.gain.value = 1.0;
+    playbackGainRef.current = gain;
+    node.connect(gain);
+    gain.connect(ctx.destination);
+
+    node.onaudioprocess = (ev) => {
+      const out = ev.outputBuffer.getChannelData(0);
+      const st = playbackStateRef.current;
+      const input = st.buf;
+      const outRate = ctx.sampleRate;
+      const step = 8000 / outRate; // input(8k) samples per output sample
+      let pos = st.pos;
+
+      for (let i = 0; i < out.length; i++) {
+        const idx = Math.floor(pos);
+        if (idx + 1 >= input.length) {
+          out[i] = 0;
+        } else {
+          const frac = pos - idx;
+          const s0 = input[idx];
+          const s1 = input[idx + 1];
+          out[i] = s0 + (s1 - s0) * frac;
+        }
+        pos += step;
+      }
+
+      const keepFrom = Math.max(0, Math.floor(pos));
+      if (keepFrom > 0) {
+        st.buf = input.slice(keepFrom);
+        pos = pos - keepFrom;
+      }
+      st.pos = pos;
+    };
+
+    playbackStartedRef.current = true;
+  }
+
+  function pushOutboundMulawForPlayback(mulaw: Uint8Array) {
+    ensurePlaybackStream();
+    const pcm = muLawToPcm16(mulaw);
+    const floats = new Float32Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) floats[i] = Math.max(-1, Math.min(1, pcm[i] / 32768));
+
+    const st = playbackStateRef.current;
+    const prev = st.buf;
+    const merged = new Float32Array(prev.length + floats.length);
+    merged.set(prev, 0);
+    merged.set(floats, prev.length);
+    st.buf = merged;
   }
 
   async function startMic() {
@@ -265,7 +314,7 @@ export default function SimulateCall() {
     outboundMulawRef.current = [];
     sendQueueRef.current = new Uint8Array(0);
     resampleRef.current = { buf: new Float32Array(0), pos: 0 };
-    playAtRef.current = 0;
+    playbackStateRef.current = { buf: new Float32Array(0), pos: 0 };
 
     if (outWavUrl) URL.revokeObjectURL(outWavUrl);
     if (outMulawUrl) URL.revokeObjectURL(outMulawUrl);
@@ -287,6 +336,12 @@ export default function SimulateCall() {
 
       // Playback context init (so first audio starts quickly)
       ensurePlaybackCtx();
+      ensurePlaybackStream();
+      try {
+        await playbackCtxRef.current?.resume();
+      } catch {
+        // ignore
+      }
 
       setState({ kind: "preparing", msg: "WebSocket接続中…" });
       await connectWs();

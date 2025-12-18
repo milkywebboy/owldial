@@ -661,21 +661,26 @@ async function handleInboundMediaMessage(session, message) {
   // 音声レベルを計算（0..100）
   const audioLevel = calculateAudioLevel(audioData);
   // 小声/モゴモゴでも拾えるよう、デフォルトは少し低めにする（必要なら環境変数で上書き）
-  const baseThreshold = Number(process.env.VAD_THRESHOLD || "2");
-  const playingThreshold = Number(process.env.VAD_THRESHOLD_WHILE_PLAYING || "6");
-  const threshold = session.isSendingAudio ? playingThreshold : baseThreshold;
+  // ただし「発話の継続判定」は開始判定よりも緩くして、途中で途切れて相槌が早発しないようにする（ヒステリシス）
+  const baseStartThreshold = Number(process.env.VAD_THRESHOLD || "2");
+  const playingStartThreshold = Number(process.env.VAD_THRESHOLD_WHILE_PLAYING || "6");
+  const startThreshold = session.isSendingAudio ? playingStartThreshold : baseStartThreshold;
+  const baseContinueThreshold = Number(process.env.VAD_CONTINUE_THRESHOLD || "1");
+  const playingContinueThreshold = Number(process.env.VAD_CONTINUE_THRESHOLD_WHILE_PLAYING || "3");
+  const continueThreshold = session.isSendingAudio ? playingContinueThreshold : baseContinueThreshold;
 
   // VADは「開始/終了の判定」のみに使い、発話中はレベルに関係なく連続でバッファリングする
   session._speechActive = session._speechActive || false;
   session._segmentBuffers = session._segmentBuffers || [];
   session._segmentLastNonSilentIndex = (typeof session._segmentLastNonSilentIndex === "number") ? session._segmentLastNonSilentIndex : -1;
 
-  const isSpeechFrame = audioLevel > threshold;
+  const isSpeechStartFrame = audioLevel > startThreshold;
+  const isSpeechContinueFrame = audioLevel > continueThreshold;
   // 発話開始の誤検知を抑えるため、連続フレームで判定する
   session._speechWarmup = session._speechWarmup || 0;
-  if (isSpeechFrame) session._speechWarmup += 1;
+  if (isSpeechStartFrame) session._speechWarmup += 1;
   else session._speechWarmup = 0;
-  const warmupNeeded = session.isSendingAudio ? Number(process.env.SPEECH_WARMUP_FRAMES_WHILE_PLAYING || "4")
+  const warmupNeeded = session.isSendingAudio ? Number(process.env.SPEECH_WARMUP_FRAMES_WHILE_PLAYING || "8")
                                              : Number(process.env.SPEECH_WARMUP_FRAMES || "2");
   const isSpeechStartConfirmed = session._speechWarmup >= warmupNeeded;
 
@@ -704,7 +709,8 @@ async function handleInboundMediaMessage(session, message) {
 
   // 発話中：レベルに関係なくフレームを連続で追加
   session._segmentBuffers.push(audioData);
-  if (isSpeechFrame) {
+  // 継続判定は開始判定より緩くする（小声/抑揚で切れないように）
+  if (isSpeechContinueFrame) {
     session.lastIncomingAudioTime = now;
     session._segmentLastNonSilentIndex = session._segmentBuffers.length - 1;
     session._lastSpeechMs = now;
@@ -714,7 +720,7 @@ async function handleInboundMediaMessage(session, message) {
   const silenceThresholdMs = Number(process.env.SILENCE_MS || "300");
   const lastSpeechAt = session.lastIncomingAudioTime || session._speechStartMs || now;
   const silenceMs = now - lastSpeechAt;
-  if (session._speechActive && silenceMs > silenceThresholdMs && !isSpeechFrame) {
+  if (session._speechActive && silenceMs > silenceThresholdMs && !isSpeechContinueFrame) {
     const endAt = now;
     const keepCount = Math.max(0, session._segmentLastNonSilentIndex + 1);
     const kept = session._segmentBuffers.slice(0, keepCount);
@@ -935,6 +941,8 @@ async function sendAudioViaWebSocket(session, mulawBuffer) {
     let wasInterrupted = false;
   
     // 音声データをバイナリチャンクに分割して送信
+    // setTimeout(20) の誤差で「ブツブツ」しやすいので、目標時刻に合わせてドリフト補正する
+    const tPacing0 = Date.now();
     for (let i = 0; i < totalChunks; i++) {
       // 中断フラグをチェック（この送信世代に対する停止要求のみ）
       if (session._stopAudioGen === gen) {
@@ -967,9 +975,13 @@ async function sendAudioViaWebSocket(session, mulawBuffer) {
         console.log(`[LAT] ws_first_chunk call=${session.callSid} label=${label} sinceStartEventMs=${sinceStartEvt} sinceEosMs=${sinceEos} t=${now}`);
       }
       
-      // 送信レートを制御（20msごとに送信）
+      // 送信レートを制御（20msごとに送信 / ドリフト補正）
       if (i < totalChunks - 1) {
-        await new Promise(resolve => setTimeout(resolve, 20));
+        const target = tPacing0 + (i + 1) * 20;
+        const delay = target - Date.now();
+        if (delay > 0) {
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
       }
     }
   
