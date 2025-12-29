@@ -145,7 +145,7 @@ async function transcribeWithGoogleSpeechMulaw(callSid, mulawBuffer) {
     console.log(
       `[STT] google_done call=${callSid} dt=${Date.now() - t0}ms chars=${transcript.length} conf=${typeof confidence === "number" ? confidence.toFixed(3) : "n/a"}`
     );
-    return transcript;
+    return { text: transcript, confidence: typeof confidence === "number" ? confidence : null };
   } catch (e) {
     // phone_call/enhancedが使えない場合は素の設定でリトライ
     console.warn(`[STT] google_failed_primary call=${callSid} err=${e.message}`);
@@ -164,8 +164,9 @@ async function transcribeWithGoogleSpeechMulaw(callSid, mulawBuffer) {
       .map((r) => r.alternatives?.[0]?.transcript || "")
       .join(" ")
       .trim();
+    const confidence2 = results2?.[0]?.alternatives?.[0]?.confidence;
     console.log(`[STT] google_done_fallback call=${callSid} dt=${Date.now() - t0}ms chars=${transcript2.length}`);
-    return transcript2;
+    return { text: transcript2, confidence: typeof confidence2 === "number" ? confidence2 : null };
   }
 }
 
@@ -231,6 +232,28 @@ async function appendAssistantRealtimeText(session, text, label, addToConversati
     );
   } catch (e) {
     console.warn(`[RT-AI] append_failed call=${session?.callSid || "unknown"} err=${e.message}`);
+  }
+}
+
+async function flushRealtimeTranscriptNow(session, finalize) {
+  if (!session || !session.callSid) return;
+  try {
+    const callRef = db.collection("calls").doc(session.callSid);
+    const text = String(session._rtTranscriptFinal || "");
+    const interim = String(session._rtTranscriptInterim || "");
+    const payload = {
+      callSid: session.callSid,
+      status: session.status || "active",
+      realtimeTranscript: text,
+      realtimeTranscriptInterim: finalize ? "" : interim,
+      realtimeTranscriptUpdatedAt: Timestamp.now(),
+    };
+    await callRef.set(payload, { merge: true });
+    if (finalize) {
+      session._rtTranscriptInterim = "";
+    }
+  } catch (e) {
+    console.warn(`[RT-STT] flush_now_failed call=${session.callSid} err=${e.message}`);
   }
 }
 
@@ -397,15 +420,179 @@ async function classifyUserTurnWithAI(session, userMessage) {
   }
 }
 
+function sanitizeCallerName(name) {
+  const cleaned = String(name || "").replace(/[^\p{L}\p{N}\p{M}ー－・\s]/gu, "").trim();
+  if (!cleaned) return "";
+  const withoutHonorific = cleaned.replace(/(さん|様|さま)$/u, "").trim();
+  const finalName = withoutHonorific || cleaned;
+  return finalName.slice(0, 30);
+}
+
+function shouldAttemptNameDetection(text, currentName) {
+  const t = (text || "").trim();
+  if (!t) return false;
+  if (!currentName) return true;
+  const keywords = ["名前", "名乗", "申します", "と申", "ともうし", "といいます", "と言います", "名は"];
+  return keywords.some((k) => t.includes(k));
+}
+
+async function extractCallerNameFromMessage(userMessage, existingName) {
+  const payload = {
+    message: (userMessage || "").trim(),
+    existingName: existingName || "",
+  };
+  if (!payload.message) return "";
+  try {
+    const resp = await openai.chat.completions.create({
+      model: process.env.NAME_EXTRACTOR_MODEL || "gpt-4o-mini",
+      temperature: 0,
+      max_tokens: 60,
+      messages: [
+        {
+          role: "system",
+          content:
+            "あなたは電話の相手が名乗った名前だけを抽出するツールです。必ずJSONのみを返してください。" +
+            "返却形式: {\"name\":\"\"}（名前が不明/他人/会社名のみの場合は空文字）。" +
+            "existingName が正しいままならそれを優先し、訂正があれば新しい名前を返してください。" +
+            "敬称や肩書きは含めず、名字のみでも構いません。",
+        },
+        { role: "user", content: JSON.stringify(payload) },
+      ],
+    });
+    const txt = (resp.choices?.[0]?.message?.content || "").trim();
+    try {
+      const obj = JSON.parse(txt || "{}");
+      return typeof obj?.name === "string" ? obj.name : "";
+    } catch (_) {
+      return "";
+    }
+  } catch (e) {
+    console.warn(`[NAME] extraction_failed err=${e.message}`);
+    return "";
+  }
+}
+
+async function detectAndStoreCallerName(session, callRef, userMessage) {
+  if (!session || !callRef) return session?._callerName || "";
+  const currentName = sanitizeCallerName(session._callerName || "");
+  if (!shouldAttemptNameDetection(userMessage, currentName)) return currentName;
+
+  const detectedRaw = await extractCallerNameFromMessage(userMessage, currentName);
+  const detected = sanitizeCallerName(detectedRaw);
+  if (!detected || detected === currentName) return currentName;
+
+  session._callerName = detected;
+  try {
+    await callRef.set({
+      name: detected,
+      callerNameDetectedAt: Timestamp.now(),
+    }, { merge: true });
+  } catch (e) {
+    console.warn(`[NAME] persist_failed call=${session.callSid || "unknown"} err=${e.message}`);
+  }
+  return detected;
+}
+
+function buildResponseWithName(session, baseText) {
+  const name = sanitizeCallerName(session?._callerName || "");
+  if (!name) return baseText;
+  return `${name}さん、${baseText}`;
+}
+
+function shouldClarifyTranscript(session, text) {
+  const meta = session?._lastTranscriptMeta || {};
+  const len = (text || "").trim().length;
+  const confidence = typeof meta.confidence === "number" ? meta.confidence : null;
+  const cooldownMs = Number(process.env.CLARIFY_COOLDOWN_MS || "8000");
+  if (session?._lastClarifyAt && Date.now() - session._lastClarifyAt < cooldownMs) return false;
+  if (!text || len === 0) return true;
+  if (confidence !== null) {
+    if (confidence < Number(process.env.LOW_CONFIDENCE_THRESHOLD || "0.82")) return true;
+    if (len <= 4 && confidence < Number(process.env.LOW_CONFIDENCE_SHORT_THRESHOLD || "0.90")) return true;
+    return false;
+  }
+  if (len <= 2) return true;
+  return false;
+}
+
+function isInPostFillerWindow(session) {
+  if (!session) return false;
+  if (session._fillerActive) return true;
+  const lastEnd = session._lastFillerEndedAt || 0;
+  const windowMs = Number(process.env.POST_FILLER_WINDOW_MS || "2500");
+  return lastEnd && Date.now() - lastEnd <= windowMs;
+}
+
+function getSilenceThresholdMs(session) {
+  const base = Number(process.env.SILENCE_MS || "300");
+  const afterFiller = Number(process.env.SILENCE_MS_AFTER_FILLER || "1700");
+  if (isInPostFillerWindow(session)) return afterFiller;
+  return base;
+}
+
 function getMergeWindowMs(session) {
   // 相槌中に話し出した場合など、直前発話の“続き”として音声を結合するための猶予
   // 短すぎると連結されず、長すぎると応答が遅くなるので環境変数で調整可能にする
   const base = Number(process.env.MERGE_WINDOW_MS || "1200");
+  const afterFiller = Number(process.env.MERGE_WINDOW_MS_AFTER_FILLER || "1700");
   // 相槌/AI音声再生中は、少し長めにして“割り込み”を拾いやすくする
+  if (isInPostFillerWindow(session)) {
+    if (session && session.isSendingAudio) {
+      return Number(process.env.MERGE_WINDOW_MS_AFTER_FILLER_WHILE_PLAYING || String(afterFiller));
+    }
+    return afterFiller;
+  }
   if (session && session.isSendingAudio) {
     return Number(process.env.MERGE_WINDOW_MS_WHILE_PLAYING || String(base));
   }
   return base;
+}
+
+async function markCallStatus(callSid, status, extra) {
+  if (!callSid) return;
+  try {
+    const callRef = db.collection("calls").doc(callSid);
+    await callRef.set(
+      {
+        callSid,
+        status,
+        statusUpdatedAt: Timestamp.now(),
+        ...(extra || {}),
+      },
+      { merge: true }
+    );
+  } catch (e) {
+    console.warn(`[CALL] status_update_failed call=${callSid} status=${status} err=${e.message}`);
+  }
+}
+
+async function finalizeCallSession(session, reason) {
+  if (!session || !session.callSid) return;
+  if (session._endedLogged) return;
+  session._endedLogged = true;
+  await flushRealtimeTranscriptNow(session, true);
+  await markCallStatus(session.callSid, "ended", {
+    endTime: Timestamp.now(),
+    endedReason: reason || "unknown",
+  });
+}
+
+async function toggleAiResponse(callSid, enabled) {
+  if (!callSid) return;
+  try {
+    const callRef = db.collection("calls").doc(callSid);
+    await callRef.set(
+      {
+        aiResponseEnabled: enabled,
+        aiResponseToggledAt: Timestamp.now(),
+      },
+      { merge: true }
+    );
+    const session = activeSessions.get(callSid);
+    if (session) session._aiResponseEnabled = enabled;
+  } catch (e) {
+    console.warn(`[CALL] toggle_ai_failed call=${callSid} err=${e.message}`);
+  }
 }
 
 function sleepMs(ms) {
@@ -803,11 +990,13 @@ async function maybePlayFillerAizuchi(session) {
     // 相槌もリアルタイム文字起こしとして表示（生成テキストをそのまま記録）
     appendAssistantRealtimeText(session, FILLER_TEXT_THINKING, "filler", true).catch(() => {});
     session._fillerActive = true;
+    session._lastFillerEndedAt = null;
     // 非同期で送信（返答生成と並列化）
     const p = sendAudioViaWebSocket(session, buf, { label: "filler" });
     session._audioSendPromise = p;
     p.finally(() => {
       session._fillerActive = false;
+      session._lastFillerEndedAt = Date.now();
       // 相槌（音声）の後、返答開始までBGMを流す
       if (session._bgmWanted) {
         startThinkingBgmLoop(session, `after_filler_turn_${turn}`).catch(() => {});
@@ -866,6 +1055,12 @@ async function handleInboundMediaMessage(session, message) {
     if (!session.onStreamSidReady && session.callSid) {
       console.log(`[WS] Setting onStreamSidReady callback for call ${session.callSid}`);
       session.onStreamSidReady = () => onStreamSidReady(session);
+    }
+
+    // statusを早めにactiveへ
+    if (session.callSid && session.status !== "active") {
+      session.status = "active";
+      markCallStatus(session.callSid, "active", { connectedAt: Timestamp.now() }).catch(() => {});
     }
 
     // connectedフラグが設定されていない場合、設定する（mediaイベントが受信されているので接続済み）
@@ -965,7 +1160,7 @@ async function handleInboundMediaMessage(session, message) {
   }
 
   // 無音が続いたら区切る（体感遅延に直結するので短めに）
-  const silenceThresholdMs = Number(process.env.SILENCE_MS || "300");
+  const silenceThresholdMs = getSilenceThresholdMs(session);
   const lastSpeechAt = session.lastIncomingAudioTime || session._speechStartMs || now;
   const silenceMs = now - lastSpeechAt;
   if (session._speechActive && silenceMs > silenceThresholdMs && frameLooksSilent) {
@@ -1307,7 +1502,14 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     const sttProvider = getSttProvider();
     if (sttProvider === "google") {
       const tStt = Date.now();
-      userMessage = (await transcribeWithGoogleSpeechMulaw(callSid, combinedAudio)).trim();
+      const transcriptGoogle = await transcribeWithGoogleSpeechMulaw(callSid, combinedAudio);
+      userMessage = (transcriptGoogle?.text || "").trim();
+      session._lastTranscriptMeta = {
+        provider: "google",
+        confidence: typeof transcriptGoogle?.confidence === "number" ? transcriptGoogle.confidence : null,
+        length: userMessage.length,
+        at: Date.now(),
+      };
       console.log(`[LAT] stt_done call=${callSid} provider=google dt=${Date.now() - tStt}ms total=${Date.now() - t0}ms chars=${userMessage.length}`);
       console.log(`[AUDIO-IN] Transcription(Google) call=${callSid}: ${userMessage}`);
     } else {
@@ -1383,6 +1585,12 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       const tWhisper = Date.now();
       const whisperResult = await transcriptionPromise;
       userMessage = (whisperResult.text || "").trim();
+      session._lastTranscriptMeta = {
+        provider: "openai",
+        confidence: null,
+        length: userMessage.length,
+        at: Date.now(),
+      };
       console.log(`[LAT] whisper_done call=${callSid} dt=${Date.now() - tWhisper}ms total=${Date.now() - t0}ms chars=${userMessage.length}`);
       console.log(`[AUDIO-IN] Whisper meta call=${callSid}: status=${whisperResult.statusCode} lang=${whisperResult.language || "n/a"} hasError=${whisperResult.error ? "yes" : "no"}`);
       console.log(`[AUDIO-IN] Transcription(Whisper) call=${callSid}: ${userMessage}`);
@@ -1394,9 +1602,11 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       await sendAudioResponseViaMediaStream(session, "すみません、少し聞き取れませんでした。もう一度お願いできますか？");
       continue;
     }
+
+    const callRef = db.collection("calls").doc(callSid);
+    await detectAndStoreCallerName(session, callRef, userMessage);
     
     // Firestoreに会話を保存
-    const callRef = db.collection("calls").doc(callSid);
     const tFs1 = Date.now();
     // 疑似電話（SIM_CALL_*）など、calls/{callSid} が無いケースでも落ちないように set(merge) を使う
     await callRef.set(
@@ -1414,12 +1624,40 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     );
     console.log(`[LAT] firestore_user_update call=${callSid} dt=${Date.now() - tFs1}ms total=${Date.now() - t0}ms`);
 
+    if (shouldClarifyTranscript(session, userMessage)) {
+      const clarify = buildResponseWithName(session, "少しお声が小さかったようです。念のため、ご用件とお名前をもう一度はっきりお聞かせいただけますか？");
+      session._lastClarifyAt = Date.now();
+      appendAssistantRealtimeText(session, clarify, "clarify", false).catch(() => {});
+      const tFsClarify = Date.now();
+      await callRef.set(
+        {
+          updatedAt: Timestamp.now(),
+          conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
+            role: "assistant",
+            content: clarify,
+            timestamp: Timestamp.now(),
+          }),
+        },
+        { merge: true }
+      );
+      console.log(`[LAT] firestore_assistant_update call=${callSid} dt=${Date.now() - tFsClarify}ms total=${Date.now() - t0}ms`);
+      const tSendClarify = Date.now();
+      await sendAudioResponseViaMediaStream(session, clarify);
+      console.log(`[LAT] send_audio_done call=${callSid} dt=${Date.now() - tSendClarify}ms total=${Date.now() - t0}ms`);
+      continue;
+    }
+
     // AIによる意図分類で、対応不能な要望は伝言へ誘導する
+    if (session._aiResponseEnabled === false) {
+      console.log(`[FLOW] ai_response_disabled call=${callSid}`);
+      continue;
+    }
+
     const cls = await classifyUserTurnWithAI(session, userMessage);
     console.log(`[FLOW] intent call=${callSid} action=${cls.action} reason=${cls.reason}`);
 
     if (cls.action === "farewell") {
-      const farewell = "承知しました。失礼いたします。";
+      const farewell = buildResponseWithName(session, "承知しました。失礼いたします。");
       console.log(`[FLOW] farewell call=${callSid}`);
       appendAssistantRealtimeText(session, farewell, "farewell", false).catch(() => {});
       const tFs2 = Date.now();
@@ -1442,7 +1680,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     }
 
     if (cls.action === "take_message") {
-      const prompt = "恐れ入りますが担当者へお繋ぎできません。伝言として承りますので、ご用件と、お名前・折り返し先（電話番号）をお話しください。";
+      const prompt = buildResponseWithName(session, "恐れ入りますが担当者へお繋ぎできません。伝言として承りますので、ご用件と、お名前・折り返し先（電話番号）をお話しください。");
       console.log(`[FLOW] take_message call=${callSid}`);
       appendAssistantRealtimeText(session, prompt, "take_message", false).catch(() => {});
       const tFs2 = Date.now();
@@ -1478,7 +1716,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
         }, { merge: true });
       } catch (_) {}
 
-      const closing = `承知しました。${CLOSING_TEXT}`;
+      const closing = buildResponseWithName(session, `承知しました。${CLOSING_TEXT}`);
       appendAssistantRealtimeText(session, closing, "closing", false).catch(() => {});
       const tFs2 = Date.now();
       await callRef.set(
@@ -1501,7 +1739,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
 
     // フォールバック（分類失敗時）: 既存の簡易判定
     if (session._closingAsked && detectNoMoreRequests(userMessage)) {
-      const farewell = "承知しました。失礼いたします。";
+      const farewell = buildResponseWithName(session, "承知しました。失礼いたします。");
       console.log(`[FLOW] no_more_requests_fallback call=${callSid}`);
       appendAssistantRealtimeText(session, farewell, "farewell", false).catch(() => {});
       const tFs2 = Date.now();
@@ -1529,6 +1767,17 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     console.log(`[LAT] firestore_get call=${callSid} dt=${Date.now() - tFsGet}ms total=${Date.now() - t0}ms`);
     const callData = callDoc.data();
     const conversations = callData?.conversations || [];
+    if (typeof callData?.aiResponseEnabled === "boolean") {
+      session._aiResponseEnabled = callData.aiResponseEnabled;
+    }
+    const callerNameFromDoc = sanitizeCallerName(callData?.name || "");
+    if (callerNameFromDoc && !session._callerName) {
+      session._callerName = callerNameFromDoc;
+    }
+    const callerName = sanitizeCallerName(session._callerName || callerNameFromDoc);
+    const systemPrompt = callerName
+      ? `あなたはテックファンドの電話応対AIです。丁寧で親切な対応を心がけてください。返答はできるだけ短く、1〜2文で要点のみ述べてください。相手に確認が必要なら短い質問を1つだけしてください。相手のお名前は「${callerName}」です。返答では自然な頻度で「${callerName}さん」のように名前を添えてください。`
+      : "あなたはテックファンドの電話応対AIです。丁寧で親切な対応を心がけてください。返答はできるだけ短く、1〜2文で要点のみ述べてください。相手に確認が必要なら短い質問を1つだけしてください。";
     
     const tChat = Date.now();
     const chatResponse = await openai.chat.completions.create({
@@ -1536,7 +1785,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       messages: [
         {
           role: "system",
-          content: "あなたはテックファンドの電話応対AIです。丁寧で親切な対応を心がけてください。返答はできるだけ短く、1〜2文で要点のみ述べてください。相手に確認が必要なら短い質問を1つだけしてください。",
+          content: systemPrompt,
         },
         ...conversations.slice(-10).map((c) => ({
           role: c.role === "user" ? "user" : "assistant",
@@ -1682,6 +1931,8 @@ async function sendInitialMessage(session) {
         session._ttsEngineForCall = callData.ttsEngine || defaultTtsEngine;
         session._ttsVoiceForCall = callData.ttsVoice || callData.voice || defaultTtsVoice;
         session._speedForCall = callData.speed || defaultSpeed;
+        const callerName = sanitizeCallerName(callData.name || "");
+        if (callerName) session._callerName = callerName;
         console.log(`[INIT-DEBUG] Firestore settings (post-send): engine=${session._ttsEngineForCall}, voice=${session._ttsVoiceForCall}, speed=${session._speedForCall}`);
       }).catch((e) => console.error(`[INIT-DEBUG] Firestore settings fetch failed: ${e.message}`));
       return;
@@ -1696,6 +1947,8 @@ async function sendInitialMessage(session) {
     session._ttsEngineForCall = ttsEngine;
     session._ttsVoiceForCall = ttsVoice;
     session._speedForCall = speed;
+    const callerName = sanitizeCallerName(callData?.name || "");
+    if (callerName) session._callerName = callerName;
 
     console.log(`[INIT-DEBUG] Firestore settings: engine=${ttsEngine}, voice=${ttsVoice}, speed=${speed}`);
 
@@ -1726,6 +1979,14 @@ async function sendInitialMessage(session) {
     console.error(`[INIT] Error sending initial audio for call ${callSid}: ${error.message}`);
     console.error(`[INIT] Error stack: ${error.stack}`);
   }
+}
+
+function triggerInitialMessageIfReady(session, reason) {
+  if (!session || session.initialMessageSent) return;
+  if (!session.streamSid || !session.startReceived) return;
+  if (!session.ws || session.ws.readyState !== WebSocket.OPEN) return;
+  console.log(`[INIT] Fast initial message trigger (${reason}) call=${session.callSid}`);
+  sendInitialMessage(session);
 }
 
 // streamSidが準備できたときのコールバック
@@ -1787,6 +2048,9 @@ function initializeSession(callSid, ws) {
     _mediaChain: Promise.resolve(),
     _segmentQueue: [],
     _segmentRunning: false,
+    _callerName: "",
+    _lastFillerEndedAt: null,
+    _aiResponseEnabled: true,
   };
 
   // streamSidが準備できたときのコールバックを設定
@@ -1852,6 +2116,9 @@ wss.on("connection", async (ws, req) => {
       _mediaChain: Promise.resolve(),
       _segmentQueue: [],
       _segmentRunning: false,
+      _callerName: "",
+      _lastFillerEndedAt: null,
+      _aiResponseEnabled: true,
     };
   } else {
     console.log(`[WS] WebSocket connection established for call ${callSid}`);
@@ -1884,6 +2151,13 @@ wss.on("connection", async (ws, req) => {
         return;
       }
 
+      if (message.event === "stop") {
+        console.log(`[WS] Stop event received for call ${session.callSid || "unknown"}`);
+        session.status = "ended";
+        await finalizeCallSession(session, "stop_event");
+        return;
+      }
+
       if (message.event === "connected") {
         // connectedイベントのメッセージ全体をログ出力
         console.log(`[WS-DEBUG] Connected event message: ${JSON.stringify(message)}`);
@@ -1898,6 +2172,9 @@ wss.on("connection", async (ws, req) => {
           const callSid = session.callSid;
           console.log(`[WS] Connected event received for call ${callSid}`);
           session.connected = true;
+          session.status = session.status || "active";
+          markCallStatus(callSid, "active").catch(() => {});
+          triggerInitialMessageIfReady(session, "connected_event");
         
           // startイベントが既に受信済みの場合は、onStreamSidReadyを呼び出す
           if (session.startReceived && session.streamSid) {
@@ -1965,6 +2242,9 @@ wss.on("connection", async (ws, req) => {
           console.log(`[WS] Saving streamSid to session for call ${callSid}: ${streamSid}`);
           session.streamSid = streamSid;
           session.startReceived = true;
+          session.status = session.status || "active";
+          markCallStatus(callSid, "active", { connectedAt: Timestamp.now() }).catch(() => {});
+          triggerInitialMessageIfReady(session, "start_event_streamsid");
           
           // connectedイベントが既に受信済みの場合は、onStreamSidReadyを呼び出す
           if (session.connected) {
@@ -2014,6 +2294,7 @@ wss.on("connection", async (ws, req) => {
     if (callSid) {
       console.log(`[WS] WebSocket closed for call ${callSid}`);
       activeSessions.delete(callSid);
+      finalizeCallSession(session, "ws_close").catch(() => {});
     } else {
       console.log(`[WS] WebSocket closed but callSid was never set`);
     }
@@ -2041,6 +2322,10 @@ async function sendAudioResponseViaMediaStream(session, text) {
     const callDoc = await db.collection("calls").doc(callSid).get();
     console.log(`[LAT] tts_firestore_get call=${callSid} dt=${Date.now() - tFs}ms total=${Date.now() - t0}ms`);
     const callData = callDoc.data();
+    const callerNameFromDoc = sanitizeCallerName(callData?.name || "");
+    if (callerNameFromDoc && !session._callerName) {
+      session._callerName = callerNameFromDoc;
+    }
     
     const ttsEngine = callData?.ttsEngine || "openai";
     const ttsVoice = callData?.ttsVoice || callData?.voice || "echo";
@@ -2140,6 +2425,88 @@ app.use(express.json());
 // ヘルスチェックエンドポイント
 app.get("/health", (req, res) => {
   res.status(200).send("OK");
+});
+
+// 転送ボタン用: 案内音声を再生し、forwardedフラグをセット
+app.post("/transfer", async (req, res) => {
+  try {
+    const callSid = String(req.body?.callSid || "").trim();
+    if (!callSid) {
+      res.status(400).json({ error: "callSid is required" });
+      return;
+    }
+    const session = activeSessions.get(callSid);
+    if (!session) {
+      res.status(404).json({ error: "active session not found" });
+      return;
+    }
+    const msg = String(req.body?.message || "人間のスタッフに転送されます。少々お待ちください。").trim();
+    const callRef = db.collection("calls").doc(callSid);
+    await callRef.set(
+      {
+        forwarded: true,
+        forwardMessage: msg,
+        forwardRequestedAt: Timestamp.now(),
+      },
+      { merge: true }
+    );
+    appendAssistantRealtimeText(session, msg, "transfer", true).catch(() => {});
+    await sendAudioResponseViaMediaStream(session, msg);
+    const target = String(req.body?.target || process.env.TRANSFER_TARGET_NUMBER || "").trim();
+    if (target && process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+      try {
+        const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+        const twiml = `<Response><Say>${msg}</Say><Dial>${target}</Dial></Response>`;
+        await twilioClient.calls(callSid).update({ twiml });
+        console.log(`[TRANSFER] Twilio transfer triggered call=${callSid} target=${target}`);
+      } catch (e) {
+        console.warn(`[TRANSFER] twilio_transfer_failed call=${callSid} err=${e.message}`);
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(`[TRANSFER] failed err=${e.message}`);
+    res.status(500).json({ error: "transfer failed", detail: e.message });
+  }
+});
+
+// AI応答の停止/再開
+app.post("/ai-response", async (req, res) => {
+  try {
+    const callSid = String(req.body?.callSid || "").trim();
+    const enabled = String(req.body?.enabled || "false").toLowerCase() === "true";
+    if (!callSid) return res.status(400).json({ error: "callSid is required" });
+    await toggleAiResponse(callSid, enabled);
+    res.json({ ok: true, enabled });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// テキストを通話相手へ返答
+app.post("/speak", async (req, res) => {
+  try {
+    const callSid = String(req.body?.callSid || "").trim();
+    const text = String(req.body?.text || "").trim();
+    if (!callSid || !text) return res.status(400).json({ error: "callSid and text are required" });
+    const session = activeSessions.get(callSid);
+    if (!session) return res.status(404).json({ error: "active session not found" });
+    const callRef = db.collection("calls").doc(callSid);
+    await callRef.set({
+      conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
+        role: "assistant",
+        content: text,
+        timestamp: Timestamp.now(),
+        label: "manual",
+      }),
+      updatedAt: Timestamp.now(),
+    }, { merge: true });
+    appendAssistantRealtimeText(session, text, "manual", true).catch(() => {});
+    await sendAudioResponseViaMediaStream(session, text);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // WebSocketアップグレード処理

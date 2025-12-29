@@ -94,6 +94,8 @@ export default function SimulateCall() {
   const [chunkMs, setChunkMs] = useState(20);
   const [waitBeforeSpeakMs, setWaitBeforeSpeakMs] = useState(250);
   const [state, setState] = useState<SimState>({ kind: "idle", msg: "" });
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [fileModeMessage, setFileModeMessage] = useState("");
 
   const [micEnabled, setMicEnabled] = useState(false);
   const [sentChunks, setSentChunks] = useState(0);
@@ -164,6 +166,67 @@ export default function SimulateCall() {
     // wsUrl が未入力のときだけ自動補完（手入力を上書きしない）
     setWsUrl((prev) => prev || wsUrlAuto);
   }, [wsUrlAuto]);
+
+  async function sendFileAsCall() {
+    if (!selectedFile) {
+      setFileModeMessage("音声ファイルを選択してください");
+      return;
+    }
+    try {
+      setState({ kind: "preparing", msg: "ファイルを読み込み中..." });
+      const arr = await selectedFile.arrayBuffer();
+      const audioCtx = new AudioContext();
+      const decoded = await audioCtx.decodeAudioData(arr.slice(0));
+      const channelData = decoded.getChannelData(0);
+      const resampleState: ResampleState = { buf: new Float32Array(0), pos: 0 };
+      const pcm16 = resampleTo8kLinear(channelData, decoded.sampleRate, resampleState);
+      const mulaw = pcm16ToMuLaw(pcm16);
+      await openSocketAndSend(mulaw);
+      setFileModeMessage("送信が完了しました");
+    } catch (e: any) {
+      setFileModeMessage(`送信に失敗しました: ${e?.message || e}`);
+      setState({ kind: "error", msg: String(e) });
+    }
+  }
+
+  async function openSocketAndSend(mulaw: Uint8Array) {
+    return new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(wsUrl || wsUrlAuto);
+      const localCallSid = callSid;
+      const localStreamSid = streamSid;
+      ws.onopen = async () => {
+        try {
+          ws.send(JSON.stringify({ event: "connected" }));
+          ws.send(JSON.stringify({
+            event: "start",
+            start: { streamSid: localStreamSid, callSid: localCallSid, accountSid: "SIMULATED" },
+          }));
+          await sleep(waitBeforeSpeakMs);
+          const totalChunks = Math.ceil(mulaw.length / chunkBytes);
+          for (let i = 0; i < totalChunks; i++) {
+            const start = i * chunkBytes;
+            const end = Math.min(start + chunkBytes, mulaw.length);
+            const chunk = mulaw.slice(start, end);
+            ws.send(JSON.stringify({
+              event: "media",
+              streamSid: localStreamSid,
+              media: { payload: bytesToBase64(chunk), track: "inbound" },
+            }));
+            if (i < totalChunks - 1) {
+              await sleep(Math.max(0, Math.floor(chunkMs / pace)));
+            }
+          }
+          ws.send(JSON.stringify({ event: "stop", streamSid: localStreamSid }));
+          setState({ kind: "done", msg: "送信完了" });
+          ws.close();
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      };
+      ws.onerror = (err) => reject(err);
+    });
+  }
 
   useEffect(() => {
     // unmount cleanup: refs only（state更新はしない）
@@ -648,6 +711,25 @@ export default function SimulateCall() {
 
         <div className="panelDivider" />
 
+        <div className="panelTitle">音声ファイル送信</div>
+        <div className="simGrid">
+          <label className="simField">
+            <div className="simLabel">音声ファイル (wav/mp3等)</div>
+            <input
+              className="simInput"
+              type="file"
+              accept="audio/*"
+              onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
+            />
+          </label>
+          <button className="simBtn" onClick={sendFileAsCall} disabled={!selectedFile}>
+            選択ファイルを送信
+          </button>
+          {fileModeMessage ? <div className="muted">{fileModeMessage}</div> : null}
+        </div>
+
+        <div className="panelDivider" />
+
         <div className="simResults">
           <div className="panelTitle">送受信</div>
           <div className="muted">sent chunks={sentChunks} / bytes={sentBytes}</div>
@@ -734,5 +816,3 @@ function mergeChunks(chunks: Uint8Array[]): Uint8Array {
   }
   return out;
 }
-
-
