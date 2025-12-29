@@ -1087,9 +1087,12 @@ async function handleInboundMediaMessage(session, message) {
     writeRealtimeSttAudio(session, audioData);
   }
 
-  // 初期挨拶の再生中は、誤検知（挨拶の回り込み等）を避けるためVAD/転写を一旦無視する
-  // 要件: 初期挨拶は相手が話し始めても中止せず最後まで再生する
+  // 初期挨拶の再生中はVAD/転写を行わないが、音声はバッファしておき挨拶終了後に処理する
+  // 要件: 初期挨拶は中断しないが、相手の発話は取りこぼさない
   if (session._greetingInProgress) {
+    session.incomingAudioBuffer = session.incomingAudioBuffer || [];
+    session.incomingAudioBuffer.push(audioData);
+    session.lastIncomingAudioTime = Date.now();
     return;
   }
 
