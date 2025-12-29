@@ -2234,6 +2234,26 @@ wss.on("connection", async (ws, req) => {
           console.error(`[WS] ERROR: callSid still not found after start event`);
           return;
         }
+
+        // SIM_CALL_* など Firestoreに無い場合に備えて最低限のドキュメントを作成
+        try {
+          const callRef = db.collection("calls").doc(callSid);
+          const snap = await callRef.get();
+          if (!snap.exists) {
+            await callRef.set({
+              callSid,
+              status: "active",
+              startTime: Timestamp.now(),
+              aiResponseEnabled: true,
+              conversations: [],
+            }, { merge: true });
+            console.log(`[WS] Initialized Firestore doc for call ${callSid}`);
+          } else if (!snap.data()?.status) {
+            await callRef.set({ status: "active", aiResponseEnabled: true }, { merge: true });
+          }
+        } catch (e) {
+          console.warn(`[WS] Firestore init failed for call ${callSid}: ${e.message}`);
+        }
         
         console.log(`[WS] Start event received for call ${callSid}`);
         const streamSid = message.start?.streamSid;
