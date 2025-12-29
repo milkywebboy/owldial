@@ -156,6 +156,29 @@ async function transcribeWithOpenAiWhisper(callSid, combinedAudio, t0) {
   return userMessage;
 }
 
+async function maybeUpdateAudioHeartbeat(session, audioLevel, bytes) {
+  if (!session || !session.callSid) return;
+  const now = Date.now();
+  const intervalMs = Number(process.env.AUDIO_HEARTBEAT_MS || "1500");
+  if (session._lastAudioHeartbeat && now - session._lastAudioHeartbeat < intervalMs) return;
+  session._lastAudioHeartbeat = now;
+  try {
+    const FieldValue = require("firebase-admin/firestore").FieldValue;
+    const callRef = db.collection("calls").doc(session.callSid);
+    await callRef.set(
+      {
+        lastAudioReceivedAt: Timestamp.now(),
+        mediaFrames: FieldValue.increment(1),
+        mediaBytes: FieldValue.increment(bytes || 0),
+        lastAudioLevel: audioLevel,
+      },
+      { merge: true }
+    );
+  } catch (e) {
+    console.warn(`[AUDIO] heartbeat_failed call=${session.callSid} err=${e.message}`);
+  }
+}
+
 function getSttProvider() {
   // "google" | "openai"
   const v = (process.env.STT_PROVIDER || "").toLowerCase().trim();
@@ -1173,6 +1196,13 @@ async function handleInboundMediaMessage(session, message) {
 
   // 音声レベルを計算（0..100）
   const audioLevel = calculateAudioLevel(audioData);
+  session._mediaFramesReceived = (session._mediaFramesReceived || 0) + 1;
+  session._mediaBytesReceived = (session._mediaBytesReceived || 0) + audioData.length;
+  const logEvery = Number(process.env.LOG_AUDIO_LEVEL_EVERY || "100");
+  if (logEvery > 0 && session._mediaFramesReceived % logEvery === 0) {
+    console.log(`[AUDIO-IN] level call=${callSid} frames=${session._mediaFramesReceived} bytes=${session._mediaBytesReceived} level=${audioLevel.toFixed(2)}`);
+  }
+  maybeUpdateAudioHeartbeat(session, audioLevel, audioData.length).catch(() => {});
   // 小声/モゴモゴでも拾えるよう、デフォルトは少し低めにする（必要なら環境変数で上書き）
   // ただし「発話の継続判定」は開始判定よりも緩くして、途中で途切れて相槌が早発しないようにする（ヒステリシス）
   const baseStartThreshold = Number(process.env.VAD_THRESHOLD || "2");
@@ -2082,6 +2112,9 @@ function initializeSession(callSid, ws) {
     _callerName: "",
     _lastFillerEndedAt: null,
     _aiResponseEnabled: true,
+    _mediaFramesReceived: 0,
+    _mediaBytesReceived: 0,
+    _lastAudioHeartbeat: 0,
   };
 
   // streamSidが準備できたときのコールバックを設定
@@ -2150,6 +2183,9 @@ wss.on("connection", async (ws, req) => {
       _callerName: "",
       _lastFillerEndedAt: null,
       _aiResponseEnabled: true,
+      _mediaFramesReceived: 0,
+      _mediaBytesReceived: 0,
+      _lastAudioHeartbeat: 0,
     };
   } else {
     console.log(`[WS] WebSocket connection established for call ${callSid}`);
