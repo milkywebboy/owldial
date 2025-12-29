@@ -96,6 +96,7 @@ export default function SimulateCall() {
   const [state, setState] = useState<SimState>({ kind: "idle", msg: "" });
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileModeMessage, setFileModeMessage] = useState("");
+  const [audioLevel, setAudioLevel] = useState(0);
 
   const [micEnabled, setMicEnabled] = useState(false);
   const [sentChunks, setSentChunks] = useState(0);
@@ -129,6 +130,7 @@ export default function SimulateCall() {
   const sendTimerRef = useRef<number | null>(null);
   const sendQueueRef = useRef<Uint8Array>(new Uint8Array(0));
   const resampleRef = useRef<ResampleState>({ buf: new Float32Array(0), pos: 0 });
+  const levelAvgRef = useRef<number[]>([]);
 
   const wsUrlAuto = useMemo(() => {
     // Hosting(owldial.web.app) は WebSocket の upgrade を扱えないため、
@@ -458,6 +460,17 @@ export default function SimulateCall() {
       proc.onaudioprocess = (ev) => {
         try {
           const input = ev.inputBuffer.getChannelData(0);
+          // meter
+          let peak = 0;
+          for (let i = 0; i < input.length; i++) {
+            const v = Math.abs(input[i]);
+            if (v > peak) peak = v;
+          }
+          levelAvgRef.current.push(peak);
+          if (levelAvgRef.current.length > 10) levelAvgRef.current.shift();
+          const avg = levelAvgRef.current.reduce((a, b) => a + b, 0) / levelAvgRef.current.length;
+          setAudioLevel(Math.min(1, avg));
+
           const pcm8k = resampleTo8kLinear(input, captureCtx.sampleRate, resampleRef.current);
           if (!pcm8k.length) return;
           const mulaw = pcm16ToMuLaw(pcm8k);
@@ -735,6 +748,12 @@ export default function SimulateCall() {
           <div className="muted">sent chunks={sentChunks} / bytes={sentBytes}</div>
           <div className="muted">
             outbound chunks={outboundChunks} / bytes={outboundBytes}
+          </div>
+          <div className="muted micLevel">
+            mic level <span className="mono">{(audioLevel * 100).toFixed(0)}%</span>
+            <div className="levelBar">
+              <div className="levelFill" style={{ width: `${Math.min(100, audioLevel * 100)}%` }} />
+            </div>
           </div>
 
           <div className="panelDivider" />
