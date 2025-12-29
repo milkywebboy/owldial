@@ -81,6 +81,81 @@ try {
   }
 }
 
+async function transcribeWithOpenAiWhisper(callSid, combinedAudio, t0) {
+  const timestamp = Date.now();
+  const inputFile = `/tmp/incoming_${timestamp}.ulaw`;
+  const outputFile = `/tmp/incoming_${timestamp}.wav`;
+  
+  fs.writeFileSync(inputFile, combinedAudio);
+  
+  const whisperGainDb = Number(process.env.WHISPER_GAIN_DB || "6"); // dB
+  const whisperFilters = process.env.WHISPER_AUDIO_FILTERS
+    || `highpass=f=120,lowpass=f=3800,volume=${whisperGainDb}dB`;
+  const ffmpegCommand = `ffmpeg -f mulaw -ar 8000 -ac 1 -i ${inputFile} -af '${whisperFilters}' -ar 16000 -ac 1 -f wav ${outputFile} -y`;
+  const tFfmpeg1 = Date.now();
+  await execAsync(ffmpegCommand);
+  console.log(`[LAT] ffmpeg_ulaw_to_wav call=${callSid} dt=${Date.now() - tFfmpeg1}ms total=${Date.now() - (t0 || tFfmpeg1)}ms`);
+  
+  const wavBuffer = fs.readFileSync(outputFile);
+  console.log(`[LAT] wav_read call=${callSid} bytes=${wavBuffer.length} total=${Date.now() - (t0 || tFfmpeg1)}ms`);
+  
+  if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
+  if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
+  
+  const FormData = require("form-data");
+  const formData = new FormData();
+  formData.append("file", wavBuffer, {
+    filename: "audio.wav",
+    contentType: "audio/wav",
+  });
+  formData.append("model", "whisper-1");
+  formData.append("language", "ja");
+  formData.append("response_format", "verbose_json");
+  formData.append("temperature", "0");
+  
+  const https = require("https");
+  const transcriptionPromise = new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: "api.openai.com",
+      path: "/v1/audio/transcriptions",
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${getOpenAIApiKey()}`,
+        ...formData.getHeaders(),
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => {
+        data += chunk;
+      });
+      res.on("end", () => {
+        try {
+          const result = JSON.parse(data);
+          resolve({
+            statusCode: res.statusCode,
+            text: result.text || "",
+            language: result.language,
+            error: result.error,
+          });
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    
+    req.on("error", reject);
+    formData.pipe(req);
+  });
+  
+  const tWhisper = Date.now();
+  const whisperResult = await transcriptionPromise;
+  const userMessage = (whisperResult.text || "").trim();
+  console.log(`[LAT] whisper_done call=${callSid} dt=${Date.now() - tWhisper}ms total=${Date.now() - (t0 || tFfmpeg1)}ms chars=${userMessage.length}`);
+  console.log(`[AUDIO-IN] Whisper meta call=${callSid}: status=${whisperResult.statusCode} lang=${whisperResult.language || "n/a"} hasError=${whisperResult.error ? "yes" : "no"}`);
+  console.log(`[AUDIO-IN] Transcription(Whisper) call=${callSid}: ${userMessage}`);
+  return userMessage;
+}
+
 function getSttProvider() {
   // "google" | "openai"
   const v = (process.env.STT_PROVIDER || "").toLowerCase().trim();
@@ -1519,98 +1594,37 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     const sttProvider = getSttProvider();
     if (sttProvider === "google") {
       const tStt = Date.now();
-      const transcriptGoogle = await transcribeWithGoogleSpeechMulaw(callSid, combinedAudio);
-      userMessage = (transcriptGoogle?.text || "").trim();
-      session._lastTranscriptMeta = {
-        provider: "google",
-        confidence: typeof transcriptGoogle?.confidence === "number" ? transcriptGoogle.confidence : null,
-        length: userMessage.length,
-        at: Date.now(),
-      };
-      console.log(`[LAT] stt_done call=${callSid} provider=google dt=${Date.now() - tStt}ms total=${Date.now() - t0}ms chars=${userMessage.length}`);
-      console.log(`[AUDIO-IN] Transcription(Google) call=${callSid}: ${userMessage}`);
+      try {
+        const transcriptGoogle = await transcribeWithGoogleSpeechMulaw(callSid, combinedAudio);
+        userMessage = (transcriptGoogle?.text || "").trim();
+        session._lastTranscriptMeta = {
+          provider: "google",
+          confidence: typeof transcriptGoogle?.confidence === "number" ? transcriptGoogle.confidence : null,
+          length: userMessage.length,
+          at: Date.now(),
+        };
+        console.log(`[LAT] stt_done call=${callSid} provider=google dt=${Date.now() - tStt}ms total=${Date.now() - t0}ms chars=${userMessage.length}`);
+        console.log(`[AUDIO-IN] Transcription(Google) call=${callSid}: ${userMessage}`);
+      } catch (e) {
+        console.warn(`[STT] google_failed call=${callSid} err=${e.message}, falling back to openai whisper`);
+        const fallbackT0 = Date.now();
+        userMessage = await transcribeWithOpenAiWhisper(callSid, combinedAudio, fallbackT0);
+        session._lastTranscriptMeta = {
+          provider: "openai",
+          confidence: null,
+          length: userMessage.length,
+          at: Date.now(),
+        };
+      }
     } else {
-      // Whisper用にmu-law形式の音声をWAV形式に変換
-      const timestamp = Date.now();
-      const inputFile = `/tmp/incoming_${timestamp}.ulaw`;
-      const outputFile = `/tmp/incoming_${timestamp}.wav`;
-      
-      fs.writeFileSync(inputFile, combinedAudio);
-      
-      // 小声/こもり声をWhisperが拾いやすいよう、簡易の帯域フィルタ＋ゲインを適用してWAVへ
-      const whisperGainDb = Number(process.env.WHISPER_GAIN_DB || "6"); // dB
-      const whisperFilters = process.env.WHISPER_AUDIO_FILTERS
-        || `highpass=f=120,lowpass=f=3800,volume=${whisperGainDb}dB`;
-      const ffmpegCommand = `ffmpeg -f mulaw -ar 8000 -ac 1 -i ${inputFile} -af '${whisperFilters}' -ar 16000 -ac 1 -f wav ${outputFile} -y`;
-      const tFfmpeg1 = Date.now();
-      await execAsync(ffmpegCommand);
-      console.log(`[LAT] ffmpeg_ulaw_to_wav call=${callSid} dt=${Date.now() - tFfmpeg1}ms total=${Date.now() - t0}ms`);
-      
-      const wavBuffer = fs.readFileSync(outputFile);
-      console.log(`[LAT] wav_read call=${callSid} bytes=${wavBuffer.length} total=${Date.now() - t0}ms`);
-      
-      // 一時ファイルを削除
-      if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
-      if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
-      
-      // Whisperで転写（OpenAI APIに直接リクエスト）
-      const FormData = require("form-data");
-      const formData = new FormData();
-      formData.append("file", wavBuffer, {
-        filename: "audio.wav",
-        contentType: "audio/wav",
-      });
-      formData.append("model", "whisper-1");
-      formData.append("language", "ja");
-      formData.append("response_format", "verbose_json");
-      formData.append("temperature", "0");
-      
-      const https = require("https");
-      const transcriptionPromise = new Promise((resolve, reject) => {
-        const req = https.request({
-          hostname: "api.openai.com",
-          path: "/v1/audio/transcriptions",
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${getOpenAIApiKey()}`,
-            ...formData.getHeaders(),
-          },
-        }, (res) => {
-          let data = "";
-          res.on("data", (chunk) => {
-            data += chunk;
-          });
-          res.on("end", () => {
-            try {
-              const result = JSON.parse(data);
-              resolve({
-                statusCode: res.statusCode,
-                text: result.text || "",
-                language: result.language,
-                error: result.error,
-              });
-            } catch (error) {
-              reject(error);
-            }
-          });
-        });
-        
-        req.on("error", reject);
-        formData.pipe(req);
-      });
-      
-      const tWhisper = Date.now();
-      const whisperResult = await transcriptionPromise;
-      userMessage = (whisperResult.text || "").trim();
+      const tWhisperStart = Date.now();
+      userMessage = await transcribeWithOpenAiWhisper(callSid, combinedAudio, tWhisperStart);
       session._lastTranscriptMeta = {
         provider: "openai",
         confidence: null,
         length: userMessage.length,
         at: Date.now(),
       };
-      console.log(`[LAT] whisper_done call=${callSid} dt=${Date.now() - tWhisper}ms total=${Date.now() - t0}ms chars=${userMessage.length}`);
-      console.log(`[AUDIO-IN] Whisper meta call=${callSid}: status=${whisperResult.statusCode} lang=${whisperResult.language || "n/a"} hasError=${whisperResult.error ? "yes" : "no"}`);
-      console.log(`[AUDIO-IN] Transcription(Whisper) call=${callSid}: ${userMessage}`);
     }
 
     // 空転写/エラーは会話履歴に入れず、再度話してもらう
