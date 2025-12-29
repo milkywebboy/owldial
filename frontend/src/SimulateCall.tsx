@@ -97,6 +97,7 @@ export default function SimulateCall() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileModeMessage, setFileModeMessage] = useState("");
   const [audioLevel, setAudioLevel] = useState(0);
+  const [micError, setMicError] = useState<string | null>(null);
 
   const [micEnabled, setMicEnabled] = useState(false);
   const [sentChunks, setSentChunks] = useState(0);
@@ -411,6 +412,12 @@ export default function SimulateCall() {
 
   async function startMic() {
     if (micEnabled) return;
+    setMicError(null);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setMicError("このブラウザ/環境ではマイクを利用できません");
+      setState({ kind: "error", msg: "マイク非対応環境です" });
+      return;
+    }
     setState({ kind: "preparing", msg: "マイク許可をリクエスト中…" });
     setSentBytes(0);
     setSentChunks(0);
@@ -510,7 +517,11 @@ export default function SimulateCall() {
       setMicEnabled(true);
     } catch (e: any) {
       await stopMic();
-      setState({ kind: "error", msg: e?.message ? `開始できません: ${e.message}` : "開始できません" });
+      const msg = e?.name === "NotAllowedError"
+        ? "マイク利用が拒否されました。ブラウザの権限を確認してください。"
+        : e?.message || "開始できません";
+      setMicError(msg);
+      setState({ kind: "error", msg });
     }
   }
 
@@ -719,6 +730,7 @@ export default function SimulateCall() {
           <div className="simStatus">
             <span className={`simPill ${state.kind}`}>{state.kind}</span>
             <span className="muted">{state.msg}</span>
+            {micError ? <div className="danger">{micError}</div> : null}
           </div>
         </div>
 
