@@ -1463,6 +1463,20 @@ async function sendAudioViaWebSocket(session, mulawBuffer) {
       }
       if (opts && opts.label === "greeting" && session._activeAudioGen === gen) {
         session._greetingInProgress = false;
+        // 挨拶中にバッファした音声を処理する
+        try {
+          const buffered = Array.isArray(session.incomingAudioBuffer) ? session.incomingAudioBuffer : [];
+          if (buffered.length) {
+            const combinedBuffered = Buffer.concat(buffered);
+            session.incomingAudioBuffer = [];
+            console.log(`[INIT] Processing buffered inbound audio after greeting call=${session.callSid} bytes=${combinedBuffered.length}`);
+            processIncomingAudio(session, combinedBuffered).catch((e) => {
+              console.warn(`[INIT] buffered_audio_process_failed call=${session.callSid} err=${e.message}`);
+            });
+          }
+        } catch (e) {
+          console.warn(`[INIT] buffered_audio_handle_failed call=${session.callSid} err=${e.message}`);
+        }
       }
     }
   })();
