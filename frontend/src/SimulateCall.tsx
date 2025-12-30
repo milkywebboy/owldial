@@ -445,6 +445,11 @@ export default function SimulateCall() {
 
       const captureCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       captureCtxRef.current = captureCtx;
+      try {
+        await captureCtx.resume();
+      } catch {
+        // ignore
+      }
 
       // Playback context init (so first audio starts quickly)
       ensurePlaybackCtx();
@@ -467,19 +472,19 @@ export default function SimulateCall() {
       proc.onaudioprocess = (ev) => {
         try {
           const input = ev.inputBuffer.getChannelData(0);
-          // meter
+          const pcm8k = resampleTo8kLinear(input, captureCtx.sampleRate, resampleRef.current);
+          if (!pcm8k.length) return;
+          // meter from resampled PCM (same data as送信)
           let peak = 0;
-          for (let i = 0; i < input.length; i++) {
-            const v = Math.abs(input[i]);
+          for (let i = 0; i < pcm8k.length; i++) {
+            const v = Math.abs(pcm8k[i]) / 32768;
             if (v > peak) peak = v;
           }
           levelAvgRef.current.push(peak);
-          if (levelAvgRef.current.length > 10) levelAvgRef.current.shift();
+          if (levelAvgRef.current.length > 8) levelAvgRef.current.shift();
           const avg = levelAvgRef.current.reduce((a, b) => a + b, 0) / levelAvgRef.current.length;
           setAudioLevel(Math.min(1, avg));
 
-          const pcm8k = resampleTo8kLinear(input, captureCtx.sampleRate, resampleRef.current);
-          if (!pcm8k.length) return;
           const mulaw = pcm16ToMuLaw(pcm8k);
           appendToSendQueue(mulaw);
         } catch {
