@@ -100,6 +100,8 @@ export default function SimulateCall() {
   const [micError, setMicError] = useState<string | null>(null);
   const [micFrames, setMicFrames] = useState(0);
   const [lastMicAt, setLastMicAt] = useState<number | null>(null);
+  const [rawPeak, setRawPeak] = useState(0);
+  const [zeroFrames, setZeroFrames] = useState(0);
 
   const [micEnabled, setMicEnabled] = useState(false);
   const [sentChunks, setSentChunks] = useState(0);
@@ -135,6 +137,8 @@ export default function SimulateCall() {
   const resampleRef = useRef<ResampleState>({ buf: new Float32Array(0), pos: 0 });
   const levelAvgRef = useRef<number[]>([]);
   const micFramesRef = useRef(0);
+  const zeroFramesRef = useRef(0);
+  const recentMicPcmRef = useRef<Int16Array[]>([]);
 
   const wsUrlAuto = useMemo(() => {
     // Hosting(owldial.web.app) は WebSocket の upgrade を扱えないため、
@@ -399,6 +403,26 @@ export default function SimulateCall() {
     playbackStartedRef.current = true;
   }
 
+  function saveRecentMicWav() {
+    try {
+      const chunks = recentMicPcmRef.current.flatMap((arr) => Array.from(arr));
+      if (!chunks.length) {
+        alert("最近のマイクPCMがありません");
+        return;
+      }
+      const pcm = Int16Array.from(chunks);
+      const wavBlob = pcm16ToWavBlob(pcm, 8000);
+      const url = URL.createObjectURL(wavBlob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "recent-mic.wav";
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert(`保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   function pushOutboundMulawForPlayback(mulaw: Uint8Array) {
     ensurePlaybackStream();
     const pcm = muLawToPcm16(mulaw);
@@ -432,8 +456,12 @@ export default function SimulateCall() {
     playbackStateRef.current = { buf: new Float32Array(0), pos: 0 };
     levelAvgRef.current = [];
     micFramesRef.current = 0;
+    zeroFramesRef.current = 0;
+    recentMicPcmRef.current = [];
     setMicFrames(0);
     setLastMicAt(null);
+    setRawPeak(0);
+    setZeroFrames(0);
 
     if (outWavUrl) URL.revokeObjectURL(outWavUrl);
     if (outMulawUrl) URL.revokeObjectURL(outMulawUrl);
@@ -479,6 +507,12 @@ export default function SimulateCall() {
       proc.onaudioprocess = (ev) => {
         try {
           const input = ev.inputBuffer.getChannelData(0);
+          let peakRaw = 0;
+          for (let i = 0; i < input.length; i++) {
+            const v = Math.abs(input[i]);
+            if (v > peakRaw) peakRaw = v;
+          }
+          setRawPeak(Math.min(1, peakRaw));
           const pcm8k = resampleTo8kLinear(input, captureCtx.sampleRate, resampleRef.current);
           if (!pcm8k.length) return;
           // meter from resampled PCM (same data as送信)
@@ -492,6 +526,13 @@ export default function SimulateCall() {
           const avg = levelAvgRef.current.reduce((a, b) => a + b, 0) / levelAvgRef.current.length;
           setAudioLevel(Math.min(1, avg));
           micFramesRef.current += 1;
+          recentMicPcmRef.current.push(Int16Array.from(pcm8k));
+          const keep = 50; // ~1s if chunkMs=20
+          if (recentMicPcmRef.current.length > keep) recentMicPcmRef.current.shift();
+          if (peak < 0.0005) {
+            zeroFramesRef.current += 1;
+            if (zeroFramesRef.current % 10 === 0) setZeroFrames(zeroFramesRef.current);
+          }
           if (micFramesRef.current % 5 === 0) {
             setMicFrames(micFramesRef.current);
             setLastMicAt(Date.now());
@@ -785,6 +826,10 @@ export default function SimulateCall() {
             </div>
             <div className="muted">
               mic frames={micFrames} {lastMicAt ? `(last ${(Date.now() - lastMicAt) / 1000}s ago)` : ""}
+            </div>
+            <div className="muted">
+              raw peak={(rawPeak * 100).toFixed(1)}% / near-zero frames={zeroFrames}
+              <button className="simBtn inlineBtn" onClick={saveRecentMicWav}>最近のマイク音声を保存</button>
             </div>
           </div>
 
