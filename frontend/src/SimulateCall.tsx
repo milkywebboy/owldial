@@ -98,6 +98,8 @@ export default function SimulateCall() {
   const [fileModeMessage, setFileModeMessage] = useState("");
   const [audioLevel, setAudioLevel] = useState(0);
   const [micError, setMicError] = useState<string | null>(null);
+  const [micFrames, setMicFrames] = useState(0);
+  const [lastMicAt, setLastMicAt] = useState<number | null>(null);
 
   const [micEnabled, setMicEnabled] = useState(false);
   const [sentChunks, setSentChunks] = useState(0);
@@ -132,6 +134,7 @@ export default function SimulateCall() {
   const sendQueueRef = useRef<Uint8Array>(new Uint8Array(0));
   const resampleRef = useRef<ResampleState>({ buf: new Float32Array(0), pos: 0 });
   const levelAvgRef = useRef<number[]>([]);
+  const micFramesRef = useRef(0);
 
   const wsUrlAuto = useMemo(() => {
     // Hosting(owldial.web.app) は WebSocket の upgrade を扱えないため、
@@ -427,6 +430,10 @@ export default function SimulateCall() {
     sendQueueRef.current = new Uint8Array(0);
     resampleRef.current = { buf: new Float32Array(0), pos: 0 };
     playbackStateRef.current = { buf: new Float32Array(0), pos: 0 };
+    levelAvgRef.current = [];
+    micFramesRef.current = 0;
+    setMicFrames(0);
+    setLastMicAt(null);
 
     if (outWavUrl) URL.revokeObjectURL(outWavUrl);
     if (outMulawUrl) URL.revokeObjectURL(outMulawUrl);
@@ -484,6 +491,11 @@ export default function SimulateCall() {
           if (levelAvgRef.current.length > 8) levelAvgRef.current.shift();
           const avg = levelAvgRef.current.reduce((a, b) => a + b, 0) / levelAvgRef.current.length;
           setAudioLevel(Math.min(1, avg));
+          micFramesRef.current += 1;
+          if (micFramesRef.current % 5 === 0) {
+            setMicFrames(micFramesRef.current);
+            setLastMicAt(Date.now());
+          }
 
           const mulaw = pcm16ToMuLaw(pcm8k);
           appendToSendQueue(mulaw);
@@ -770,6 +782,9 @@ export default function SimulateCall() {
             mic level <span className="mono">{(audioLevel * 100).toFixed(0)}%</span>
             <div className="levelBar">
               <div className="levelFill" style={{ width: `${Math.min(100, audioLevel * 100)}%` }} />
+            </div>
+            <div className="muted">
+              mic frames={micFrames} {lastMicAt ? `(last ${(Date.now() - lastMicAt) / 1000}s ago)` : ""}
             </div>
           </div>
 
