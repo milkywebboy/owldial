@@ -804,6 +804,24 @@ async function generateThinkingBgmMulawBuffer(callSid) {
   return mulawBuffer;
 }
 
+function computeMulawPeak(mulawBuffer) {
+  if (!mulawBuffer || !mulawBuffer.length) return 0;
+  let peak = 0;
+  for (let i = 0; i < mulawBuffer.length; i++) {
+    const s = mulawBuffer[i];
+    // μ-law decode approximate to PCM 16-bit range
+    const mu = 255 - s;
+    const sign = (mu & 0x80) ? -1 : 1;
+    const exponent = (mu >> 4) & 0x07;
+    const mantissa = mu & 0x0F;
+    let sample = ((mantissa << 1) + 33) << (exponent + 2);
+    sample = sign * sample;
+    const abs = Math.abs(sample) / 32768;
+    if (abs > peak) peak = abs;
+  }
+  return peak;
+}
+
 async function ensureThinkingBgmBuffer(session) {
   let buf = getCachedThinkingBgmAudio();
   if (buf) return buf;
@@ -1622,6 +1640,8 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     // STT: Google / OpenAI(Whisper) 切替
     let userMessage = "";
     const sttProvider = getSttProvider();
+    const segmentPeak = computeMulawPeak(combinedAudio);
+    session._lastSegmentPeak = segmentPeak;
     if (sttProvider === "google") {
       const tStt = Date.now();
       try {
@@ -1655,6 +1675,25 @@ async function processIncomingAudio(session, combinedAudioOverride) {
         length: userMessage.length,
         at: Date.now(),
       };
+      // Whisperで短すぎたらGoogleでもリトライ
+      if (userMessage.length < 3 && speechClient) {
+        try {
+          const retry = await transcribeWithGoogleSpeechMulaw(callSid, combinedAudio);
+          const retryText = (retry?.text || "").trim();
+          if (retryText.length > userMessage.length) {
+            userMessage = retryText;
+            session._lastTranscriptMeta = {
+              provider: "google-retry",
+              confidence: typeof retry?.confidence === "number" ? retry.confidence : null,
+              length: userMessage.length,
+              at: Date.now(),
+            };
+            console.log(`[STT] whisper_short_google_retry call=${callSid} chars=${userMessage.length}`);
+          }
+        } catch (e) {
+          console.warn(`[STT] whisper_retry_google_failed call=${callSid} err=${e.message}`);
+        }
+      }
     }
 
     // 空転写/エラーは会話履歴に入れず、再度話してもらう
@@ -1675,6 +1714,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
         callSid,
         status: "active",
         updatedAt: Timestamp.now(),
+        lastSegmentPeak: segmentPeak,
         conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
           role: "user",
           content: userMessage,
