@@ -1055,6 +1055,7 @@ function requestStopAudio(session, reason) {
 
 async function stopOngoingAudio(session, reason) {
   if (!session || !session.isSendingAudio) return;
+  rememberAssistantTextBeforeStop(session);
   requestStopAudio(session, reason);
   // 送信ループが止まるのを待つ（20ms刻みなので基本すぐ止まる）
   if (session._audioSendPromise) {
@@ -1135,6 +1136,11 @@ async function handleInboundMediaMessage(session, message) {
   if (track && track !== "inbound") return;
 
   if (!payload) return;
+
+  if (session.isSendingAudio && !session._greetingInProgress) {
+    // 呼びかけ開始時にAI音声を止め、返答テキストを結合できるよう保持
+    stopOngoingAudio(session, "caller_speech").catch(() => {});
+  }
 
   // mediaイベントが受信された時点で、startイベントがまだ受信されていない場合、
   // streamSidをmediaイベントから取得して初期メッセージを送信する
@@ -1462,6 +1468,7 @@ async function sendAudioViaWebSocket(session, mulawBuffer) {
   const opts = arguments.length >= 3 ? arguments[2] : undefined; // (session, buf, {label, uninterruptible})
   const sendPromise = (async () => {
     console.log(`[WS-AUDIO] Starting audio send via WebSocket for call ${session.callSid}`);
+    session._lastAssistantText = opts?.textPayload || "";
     
     // WebSocket接続状態の検証
     if (!session || !session.ws) {
@@ -1525,10 +1532,10 @@ async function sendAudioViaWebSocket(session, mulawBuffer) {
   
         const start = i * chunkSize;
         const end = Math.min(start + chunkSize, mulawBuffer.length);
-        const chunk = mulawBuffer.slice(start, end);
-        
-        // 各チャンクをbase64エンコード
-        const base64Payload = chunk.toString("base64");
+      const chunk = mulawBuffer.slice(start, end);
+      
+      // 各チャンクをbase64エンコード
+      const base64Payload = chunk.toString("base64");
   
         const mediaMessage = {
           event: "media",
@@ -1606,6 +1613,28 @@ async function sendAudioViaWebSocket(session, mulawBuffer) {
 
   session._audioSendPromise = sendPromise;
   return await sendPromise;
+}
+
+function mergeInterruptedAssistantText(session, newText) {
+  try {
+    const prev = session?._interruptedAssistantText || "";
+    if (!prev) return newText;
+    const merged = `${prev} ${newText}`.replace(/\s+/g, " ").trim();
+    session._interruptedAssistantText = "";
+    return merged;
+  } catch {
+    return newText;
+  }
+}
+
+function rememberAssistantTextBeforeStop(session) {
+  try {
+    if (!session || !session._lastAssistantText) return;
+    session._interruptedAssistantText = session._lastAssistantText;
+    session._lastAssistantText = "";
+  } catch {
+    // ignore
+  }
 }
 
 // 受信した音声を処理（Whisperで転写して返答を生成）
@@ -1899,6 +1928,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     console.log(`[LAT] chat_done call=${callSid} dt=${Date.now() - tChat}ms total=${Date.now() - t0}ms`);
     
     let aiResponse = (chatResponse.choices[0]?.message?.content || "").trim();
+    aiResponse = mergeInterruptedAssistantText(session, aiResponse);
     // 念のため過度に長い返答は切り詰める（会話履歴/音声も短くする）
     const maxChars = Number(process.env.MAX_RESPONSE_CHARS || "140");
     if (aiResponse.length > maxChars) {
