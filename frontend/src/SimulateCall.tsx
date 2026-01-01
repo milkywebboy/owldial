@@ -85,6 +85,15 @@ type AssistantUtterance = {
   timestamp?: Timestamp;
 };
 
+type RealtimeServerMessage = {
+  key: string;
+  role: "user" | "assistant";
+  content: string;
+  label?: string;
+  time: number;
+  interim?: boolean;
+};
+
 export default function SimulateCall() {
   const [wsUrl, setWsUrl] = useState("");
   const [callSid, setCallSid] = useState(() => randomId("SIM_CALL_"));
@@ -118,6 +127,8 @@ export default function SimulateCall() {
   const [fsRtFinal, setFsRtFinal] = useState("");
   const [fsRtInterim, setFsRtInterim] = useState("");
   const [fsAssistant, setFsAssistant] = useState<AssistantUtterance[]>([]);
+  const [fsRtUpdatedAt, setFsRtUpdatedAt] = useState<number | null>(null);
+  const [fsUserMessages, setFsUserMessages] = useState<RealtimeServerMessage[]>([]);
 
   const [outboundBytes, setOutboundBytes] = useState(0);
   const [outboundChunks, setOutboundChunks] = useState(0);
@@ -164,6 +175,8 @@ export default function SimulateCall() {
           setFsRtFinal(String(d?.realtimeTranscript || ""));
           setFsRtInterim(String(d?.realtimeTranscriptInterim || ""));
           setFsAssistant(Array.isArray(d?.realtimeAssistantUtterances) ? d.realtimeAssistantUtterances : []);
+          const updatedAt = d?.realtimeTranscriptUpdatedAt;
+          setFsRtUpdatedAt(typeof updatedAt?.toMillis === "function" ? updatedAt.toMillis() : null);
         },
         () => {
           // ignore (simulator should still work without Firestore)
@@ -179,6 +192,77 @@ export default function SimulateCall() {
     // wsUrl が未入力のときだけ自動補完（手入力を上書きしない）
     setWsUrl((prev) => prev || wsUrlAuto);
   }, [wsUrlAuto]);
+
+  useEffect(() => {
+    setFsRtFinal("");
+    setFsRtInterim("");
+    setFsAssistant([]);
+    setFsRtUpdatedAt(null);
+    setFsUserMessages([]);
+  }, [callSid]);
+
+  useEffect(() => {
+    setFsUserMessages((prev) => {
+      const lines = fsRtFinal
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+
+      const updatedAt = fsRtUpdatedAt ?? Date.now();
+      const existingKeys = new Set(prev.map((m) => m.key));
+      const next = [...prev];
+
+      lines.forEach((line, idx) => {
+        const key = `${idx}::${line}`;
+        if (existingKeys.has(key)) return;
+        next.push({
+          key,
+          role: "user",
+          content: line,
+          label: "server final",
+          time: updatedAt + idx * 0.001,
+        });
+      });
+
+      const validKeys = new Set(lines.map((line, idx) => `${idx}::${line}`));
+      return next.filter((m) => (m.role === "user" ? validKeys.has(m.key) : true)).slice(-120);
+    });
+  }, [fsRtFinal, fsRtUpdatedAt]);
+
+  const fsRealtimeChat = useMemo<RealtimeServerMessage[]>(() => {
+    const base: RealtimeServerMessage[] = [...fsUserMessages];
+    const updatedAt = fsRtUpdatedAt ?? Date.now();
+
+    fsAssistant.forEach((m, idx) => {
+      const content = String(m?.content || "").trim();
+      if (!content) return;
+      const ts = typeof m?.timestamp?.toMillis === "function" ? m.timestamp.toMillis() : null;
+      base.push({
+        key: `assistant-${ts || updatedAt}-${idx}-${content}`,
+        role: "assistant",
+        content,
+        label: m?.label ? `server:${m.label}` : "server",
+        time: ts ?? updatedAt + idx * 0.001,
+      });
+    });
+
+    const interim = fsRtInterim.trim();
+    if (interim) {
+      base.push({
+        key: "user-interim",
+        role: "user",
+        content: interim,
+        label: "server interim",
+        time: updatedAt + fsUserMessages.length * 0.001 + 0.0005,
+        interim: true,
+      });
+    }
+
+    return base
+      .filter((m) => m.content.trim())
+      .sort((a, b) => (a.time || 0) - (b.time || 0))
+      .slice(-150);
+  }, [fsAssistant, fsRtInterim, fsRtUpdatedAt, fsUserMessages]);
 
   async function loadDevices() {
     if (deviceLoadInFlightRef.current) return;
@@ -906,25 +990,15 @@ export default function SimulateCall() {
           <div className="panelTitle">リアルタイム文字起こし（サーバ/Firestore：顧客 + AI）</div>
           <div className="muted">※通話サーバ側で生成した転写/相槌/返答のリアルタイム表示です。</div>
           <div className="chat">
-            {fsRtFinal ? (
-              <div className="msg user">
-                <div className="msgRole">user (server final)</div>
-                <div className="msgText">{fsRtFinal}</div>
-              </div>
-            ) : null}
-            {fsRtInterim ? (
-              <div className="msg user">
-                <div className="msgRole">user (server interim)</div>
-                <div className="msgText">{fsRtInterim}</div>
-              </div>
-            ) : null}
-            {fsAssistant.slice(-30).map((m, idx) => (
-              <div key={idx} className="msg assistant">
-                <div className="msgRole">{`assistant (server${m.label ? `:${m.label}` : ""})`}</div>
-                <div className="msgText">{m.content || ""}</div>
+            {fsRealtimeChat.map((m) => (
+              <div key={m.key} className={`msg ${m.role} ${m.interim ? "interim" : ""}`}>
+                <div className="msgRole">
+                  {m.role} ({m.label || "server"})
+                </div>
+                <div className="msgText">{m.content}</div>
               </div>
             ))}
-            {!fsRtFinal && !fsRtInterim && fsAssistant.length === 0 ? <div className="empty">まだありません</div> : null}
+            {fsRealtimeChat.length === 0 ? <div className="empty">まだありません</div> : null}
           </div>
 
           {outWavUrl ? (
