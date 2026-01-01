@@ -13,6 +13,7 @@ import "./App.css";
 import SimulateCall from "./SimulateCall";
 import { getFirebaseWebConfigFromEnvOrDefault } from "./firebaseConfig";
 import { APP_VERSION } from "./version";
+import { DEFAULT_API_BASE } from "./appConfig";
 
 type Conversation = {
   role: "user" | "assistant";
@@ -27,8 +28,11 @@ type CallDoc = {
   from?: string;
   to?: string;
   status?: string;
+  aiResponseEnabled?: boolean;
   startTime?: Timestamp;
   endTime?: Timestamp;
+  forwardMessage?: string;
+  forwarded?: boolean;
   conversations?: Conversation[];
   purposeCaptured?: boolean;
   purposeMessage?: string;
@@ -44,12 +48,129 @@ type CallDoc = {
   realtimeAssistantUpdatedAt?: Timestamp;
 };
 
+type RealtimeChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+  label?: string;
+  time?: number;
+  kind: "conversation" | "rt_final" | "rt_interim" | "rt_assistant";
+  interim?: boolean;
+};
+
+function toMillis(t?: Timestamp) {
+  return t && typeof t.toMillis === "function" ? t.toMillis() : 0;
+}
+
 export default function App() {
   const { cfg, hasProjectId } = useMemo(() => getFirebaseWebConfigFromEnvOrDefault(), []);
   const [calls, setCalls] = useState<Array<{ id: string; data: CallDoc }>>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<"logs" | "sim">("logs");
+  const [transferMessage, setTransferMessage] = useState("人間のスタッフに転送されます。少々お待ちください。");
+  const [transferTarget, setTransferTarget] = useState("");
+  const [apiBase, setApiBase] = useState(DEFAULT_API_BASE);
+  const [transferStatus, setTransferStatus] = useState<string | null>(null);
+  const [aiEnabled, setAiEnabled] = useState(true);
+  const [manualText, setManualText] = useState("");
+  const [aiToggleStatus, setAiToggleStatus] = useState<string | null>(null);
+  const [manualStatus, setManualStatus] = useState<string | null>(null);
+
+  const selected = calls.find((c) => c.id === selectedId);
+  const realtimeChat = useMemo<RealtimeChatMessage[]>(() => {
+    if (!selected) return [];
+    const data = selected.data || {};
+    const now = Date.now();
+
+    const conversationMessages: RealtimeChatMessage[] = (data.conversations || []).map((m) => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: m.content,
+      label: m.label,
+      time: toMillis(m.timestamp),
+      kind: "conversation",
+      interim: false,
+    }));
+
+    const conversationKeys = new Set(
+      conversationMessages
+        .filter((m) => m.content?.trim())
+        .map((m) => `${m.role}::${m.content.trim()}`)
+    );
+
+    const timeline: RealtimeChatMessage[] = [...conversationMessages];
+
+    (data.realtimeAssistantUtterances || []).forEach((m) => {
+      const content = String(m?.content || "").trim();
+      if (!content) return;
+      const key = `assistant::${content}`;
+      if (conversationKeys.has(key)) return;
+      timeline.push({
+        role: "assistant",
+        content,
+        label: m?.label ? `rt:${m.label}` : "rt",
+        time: toMillis(m?.timestamp) || toMillis(data.realtimeAssistantUpdatedAt),
+        kind: "rt_assistant",
+        interim: false,
+      });
+    });
+
+    const rtUpdatedAt = toMillis(data.realtimeTranscriptUpdatedAt) || now;
+    const rtFinal = String(data.realtimeTranscript || "").trim();
+    if (rtFinal && !conversationKeys.has(`user::${rtFinal}`)) {
+      timeline.push({
+        role: "user",
+        content: rtFinal,
+        label: "rt final",
+        time: rtUpdatedAt,
+        kind: "rt_final",
+        interim: false,
+      });
+    }
+
+    const rtInterim = String(data.realtimeTranscriptInterim || "").trim();
+    if (rtInterim) {
+      timeline.push({
+        role: "user",
+        content: rtInterim,
+        label: "rt interim",
+        time: rtUpdatedAt + 0.5,
+        kind: "rt_interim",
+        interim: true,
+      });
+    }
+
+    const sorted = timeline
+      .filter((m) => m.content?.trim())
+      .sort((a, b) => (a.time || 0) - (b.time || 0));
+
+    const deduped: RealtimeChatMessage[] = [];
+    const seenNonInterim = new Set<string>();
+    let lastInterimIndex = -1;
+
+    sorted.forEach((msg) => {
+      if (msg.kind === "rt_interim") {
+        if (lastInterimIndex >= 0) {
+          deduped.splice(lastInterimIndex, 1);
+        }
+        deduped.push(msg);
+        lastInterimIndex = deduped.length - 1;
+        return;
+      }
+
+      const key = `${msg.role}::${msg.content}::${msg.kind}`;
+      if (seenNonInterim.has(key)) return;
+      seenNonInterim.add(key);
+      deduped.push(msg);
+    });
+
+    return deduped.slice(-120);
+  }, [selected]);
+
+  const formatTime = (ms?: number) => {
+    if (!ms) return "";
+    const d = new Date(ms);
+    return d.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  };
 
   useEffect(() => {
     if (!hasProjectId) return;
@@ -72,7 +193,65 @@ export default function App() {
     }
   }, [cfg, hasProjectId, selectedId]);
 
-  const selected = calls.find((c) => c.id === selectedId);
+  useEffect(() => {
+    if (!selected) return;
+    if (typeof selected.data.aiResponseEnabled === "boolean") {
+      setAiEnabled(Boolean(selected.data.aiResponseEnabled));
+    }
+  }, [selected?.data.aiResponseEnabled]);
+
+  async function triggerTransfer() {
+    if (!selected) return;
+    setTransferStatus(null);
+    try {
+      const resp = await fetch(`${apiBase}/transfer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ callSid: selected.id, message: transferMessage, target: transferTarget }),
+      });
+      if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(txt || resp.statusText);
+      }
+      setTransferStatus("転送案内を送信しました");
+    } catch (e: any) {
+      setTransferStatus(`エラー: ${e?.message || e}`);
+    }
+  }
+
+  async function toggleAi(enabled: boolean) {
+    if (!selected) return;
+    setAiToggleStatus(null);
+    try {
+      const resp = await fetch(`${apiBase}/ai-response`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ callSid: selected.id, enabled }),
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      setAiEnabled(enabled);
+      setAiToggleStatus(enabled ? "AI応答を再開しました" : "AI応答を停止しました");
+    } catch (e: any) {
+      setAiToggleStatus(`エラー: ${e?.message || e}`);
+    }
+  }
+
+  async function sendManualResponse() {
+    if (!selected || !manualText.trim()) return;
+    setManualStatus(null);
+    try {
+      const resp = await fetch(`${apiBase}/speak`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ callSid: selected.id, text: manualText }),
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      setManualStatus("送信しました");
+      setManualText("");
+    } catch (e: any) {
+      setManualStatus(`エラー: ${e?.message || e}`);
+    }
+  }
 
   return (
     <div className="page">
@@ -152,8 +331,28 @@ export default function App() {
             ) : (
               <div className="detailBody">
                 <div className="kv">
+                  <div className="k">API base</div>
+                  <div className="v">
+                    <input
+                      value={apiBase}
+                      onChange={(e) => setApiBase(e.target.value)}
+                      className="input"
+                      placeholder="https://media-stream...（/transfer 用）"
+                    />
+                  </div>
+                </div>
+                <div className="kv">
                   <div className="k">status</div>
                   <div className="v">{selected.data.status || "-"}</div>
+                </div>
+                <div className="kv">
+                  <div className="k">AI応答</div>
+                  <div className="v">
+                    <span className={`badge ${aiEnabled ? "active" : "unknown"}`}>{aiEnabled ? "enabled" : "stopped"}</span>
+                    <button className="primary" onClick={() => toggleAi(true)} disabled={aiEnabled}>再開</button>
+                    <button onClick={() => toggleAi(false)} disabled={!aiEnabled}>停止</button>
+                    {aiToggleStatus ? <div className="muted">{aiToggleStatus}</div> : null}
+                  </div>
                 </div>
                 <div className="kv">
                   <div className="k">from</div>
@@ -173,6 +372,56 @@ export default function App() {
                     <div className="v">{selected.data.purposeMessage}</div>
                   </div>
                 ) : null}
+                <div className="kv">
+                  <div className="k">forwarded</div>
+                  <div className="v">{selected.data.forwarded ? "true" : "false"}</div>
+                </div>
+                <div className="kv">
+                  <div className="k">forwardMessage</div>
+                  <div className="v">{selected.data.forwardMessage || "-"}</div>
+                </div>
+
+                <div className="panelDivider" />
+                <div className="panelTitle">転送ボタン</div>
+                <div className="kv">
+                  <div className="k">案内メッセージ</div>
+                  <div className="v">
+                    <input
+                      className="input"
+                      value={transferMessage}
+                      onChange={(e) => setTransferMessage(e.target.value)}
+                    />
+                  </div>
+                </div>
+                <div className="kv">
+                  <div className="k">転送先番号</div>
+                  <div className="v">
+                    <input
+                      className="input"
+                      value={transferTarget}
+                      onChange={(e) => setTransferTarget(e.target.value)}
+                      placeholder="例: +81..."
+                    />
+                  </div>
+                </div>
+                <button className="primary" onClick={triggerTransfer}>転送案内を再生</button>
+                {transferStatus ? <div className="muted">{transferStatus}</div> : null}
+
+                <div className="panelDivider" />
+                <div className="panelTitle">手動返答</div>
+                <div className="kv">
+                  <div className="k">テキスト</div>
+                  <div className="v">
+                    <textarea
+                      className="input"
+                      value={manualText}
+                      onChange={(e) => setManualText(e.target.value)}
+                      placeholder="通話相手への返答"
+                    />
+                  </div>
+                </div>
+                <button className="primary" onClick={sendManualResponse} disabled={!manualText.trim()}>通話中の相手に返答する</button>
+                {manualStatus ? <div className="muted">{manualStatus}</div> : null}
 
                 <div className="panelDivider" />
 
@@ -189,37 +438,27 @@ export default function App() {
                   ) : null}
                 </div>
 
-              {selected.data.realtimeTranscript ||
-              selected.data.realtimeTranscriptInterim ||
-              selected.data.realtimeAssistantUtterances?.length ? (
-                <>
-                  <div className="panelDivider" />
-                  <div className="panelTitle">リアルタイム文字起こし（顧客 + AI）</div>
-                  {selected.data.realtimeTranscript ? (
-                    <div className="msg user">
-                      <div className="msgRole">user (rt final)</div>
-                      <div className="msgText">{selected.data.realtimeTranscript}</div>
-                    </div>
-                  ) : null}
-                  {selected.data.realtimeTranscriptInterim ? (
-                    <div className="msg user">
-                      <div className="msgRole">user (rt interim)</div>
-                      <div className="msgText">{selected.data.realtimeTranscriptInterim}</div>
-                    </div>
-                  ) : null}
-
-                  {selected.data.realtimeAssistantUtterances?.length ? (
-                    <div className="chat">
-                      {selected.data.realtimeAssistantUtterances.slice(-30).map((m, idx) => (
-                        <div key={idx} className="msg assistant">
-                          <div className="msgRole">{`assistant (rt${m.label ? `:${m.label}` : ""})`}</div>
-                          <div className="msgText">{m.content || ""}</div>
+                {realtimeChat.length ? (
+                  <>
+                    <div className="panelDivider" />
+                    <div className="panelTitle">リアルタイム文字起こし（チャット表示）</div>
+                    <div className="chatStream">
+                      {realtimeChat.map((m, idx) => (
+                        <div
+                          key={`${m.role}-${m.time || idx}-${m.kind}-${idx}`}
+                          className={`chatBubble ${m.role} ${m.interim ? "interim" : ""}`}
+                        >
+                          <div className="chatMeta">
+                            <span className="chatRole">{m.role === "assistant" ? "AI" : "顧客"}</span>
+                            {m.label ? <span className="chatLabel">{m.label}</span> : null}
+                            {m.time ? <span className="chatTime">{formatTime(m.time)}</span> : null}
+                          </div>
+                          <div className="chatText">{m.content}</div>
                         </div>
                       ))}
                     </div>
-                  ) : null}
-                </>
-              ) : null}
+                  </>
+                ) : null}
               </div>
             )}
           </section>
@@ -228,5 +467,3 @@ export default function App() {
     </div>
   );
 }
-
-

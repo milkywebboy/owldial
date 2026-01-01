@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import * as admin from "firebase-admin";
 import twilio from "twilio";
+import { sendSlackStartMessage } from "./slack-notifier";
 
 export class TwilioWebhookHandler {
   // テスト用: TwiMLの内容を確認するエンドポイント
@@ -45,26 +46,48 @@ export class TwilioWebhookHandler {
       const callSid = req.body.CallSid;
       const from = req.body.From;
       const to = req.body.To;
+      const db = admin.firestore();
+
+      // 既存プロファイルを参照
+      let profileData: any = {};
+      const profileId = (from || "").replace(/[^0-9+]/g, "");
+      if (profileId) {
+        const profileSnap = await db.collection("callerProfiles").doc(profileId).get();
+        if (profileSnap.exists) profileData = profileSnap.data() || {};
+      }
 
       // Firestoreに通話情報を保存
-      const db = admin.firestore();
       const callRef = db.collection("calls").doc(callSid);
-      
-      await callRef.set({
+      const initialDoc = {
         callSid,
         from,
         to,
         status: "ringing",
         startTime: admin.firestore.FieldValue.serverTimestamp(),
         conversations: [],
-        name: "",
-        requirement: "",
+        name: profileData.lastName || "",
+        requirement: profileData.lastSummary || "",
         aiResponseEnabled: true,
         forwarded: false,
         voice: "echo", // デフォルトの音声設定（後方互換性のため）
         ttsEngine: "openai", // TTSエンジン: "google" または "openai"
         ttsVoice: "echo", // TTS音声（OpenAI TTS: Echo）
-      });
+      };
+      await callRef.set(initialDoc);
+
+      // Slack通知（着信）
+      await sendSlackStartMessage(initialDoc, callSid);
+
+      // プロファイルの最終着信を更新
+      if (profileId) {
+        await db.collection("callerProfiles").doc(profileId).set(
+          {
+            lastCallId: callSid,
+            lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
 
       // Media Stream WebSocket URLを生成
       // Cloud RunのURLはhttps://なので、wss://に変換
@@ -109,4 +132,3 @@ export class TwilioWebhookHandler {
     }
   }
 }
-

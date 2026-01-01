@@ -94,6 +94,16 @@ export default function SimulateCall() {
   const [chunkMs, setChunkMs] = useState(20);
   const [waitBeforeSpeakMs, setWaitBeforeSpeakMs] = useState(250);
   const [state, setState] = useState<SimState>({ kind: "idle", msg: "" });
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [fileModeMessage, setFileModeMessage] = useState("");
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [micError, setMicError] = useState<string | null>(null);
+  const [micFrames, setMicFrames] = useState(0);
+  const [lastMicAt, setLastMicAt] = useState<number | null>(null);
+  const [rawPeak, setRawPeak] = useState(0);
+  const [zeroFrames, setZeroFrames] = useState(0);
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>("");
 
   const [micEnabled, setMicEnabled] = useState(false);
   const [sentChunks, setSentChunks] = useState(0);
@@ -127,6 +137,11 @@ export default function SimulateCall() {
   const sendTimerRef = useRef<number | null>(null);
   const sendQueueRef = useRef<Uint8Array>(new Uint8Array(0));
   const resampleRef = useRef<ResampleState>({ buf: new Float32Array(0), pos: 0 });
+  const levelAvgRef = useRef<number[]>([]);
+  const micFramesRef = useRef(0);
+  const zeroFramesRef = useRef(0);
+  const recentMicPcmRef = useRef<Int16Array[]>([]);
+  const deviceLoadInFlightRef = useRef(false);
 
   const wsUrlAuto = useMemo(() => {
     // Hosting(owldial.web.app) は WebSocket の upgrade を扱えないため、
@@ -164,6 +179,89 @@ export default function SimulateCall() {
     // wsUrl が未入力のときだけ自動補完（手入力を上書きしない）
     setWsUrl((prev) => prev || wsUrlAuto);
   }, [wsUrlAuto]);
+
+  async function loadDevices() {
+    if (deviceLoadInFlightRef.current) return;
+    deviceLoadInFlightRef.current = true;
+    try {
+      if (!navigator.mediaDevices?.enumerateDevices) return;
+      const list = await navigator.mediaDevices.enumerateDevices();
+      const inputs = list.filter((d) => d.kind === "audioinput");
+      setDevices(inputs);
+      if (!selectedDeviceId && inputs[0]) {
+        setSelectedDeviceId(inputs[0].deviceId);
+      }
+    } catch {
+      // ignore
+    } finally {
+      deviceLoadInFlightRef.current = false;
+    }
+  }
+
+  useEffect(() => {
+    loadDevices();
+  }, []);
+
+  async function sendFileAsCall() {
+    if (!selectedFile) {
+      setFileModeMessage("音声ファイルを選択してください");
+      return;
+    }
+    try {
+      setState({ kind: "preparing", msg: "ファイルを読み込み中..." });
+      const arr = await selectedFile.arrayBuffer();
+      const audioCtx = new AudioContext();
+      const decoded = await audioCtx.decodeAudioData(arr.slice(0));
+      const channelData = decoded.getChannelData(0);
+      const resampleState: ResampleState = { buf: new Float32Array(0), pos: 0 };
+      const pcm16 = resampleTo8kLinear(channelData, decoded.sampleRate, resampleState);
+      const mulaw = pcm16ToMuLaw(pcm16);
+      await openSocketAndSend(mulaw);
+      setFileModeMessage("送信が完了しました");
+    } catch (e: any) {
+      setFileModeMessage(`送信に失敗しました: ${e?.message || e}`);
+      setState({ kind: "error", msg: String(e) });
+    }
+  }
+
+  async function openSocketAndSend(mulaw: Uint8Array) {
+    return new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(wsUrl || wsUrlAuto);
+      const localCallSid = callSid;
+      const localStreamSid = streamSid;
+      ws.onopen = async () => {
+        try {
+          ws.send(JSON.stringify({ event: "connected" }));
+          ws.send(JSON.stringify({
+            event: "start",
+            start: { streamSid: localStreamSid, callSid: localCallSid, accountSid: "SIMULATED" },
+          }));
+          await sleep(waitBeforeSpeakMs);
+          const totalChunks = Math.ceil(mulaw.length / chunkBytes);
+          for (let i = 0; i < totalChunks; i++) {
+            const start = i * chunkBytes;
+            const end = Math.min(start + chunkBytes, mulaw.length);
+            const chunk = mulaw.slice(start, end);
+            ws.send(JSON.stringify({
+              event: "media",
+              streamSid: localStreamSid,
+              media: { payload: bytesToBase64(chunk), track: "inbound" },
+            }));
+            if (i < totalChunks - 1) {
+              await sleep(Math.max(0, Math.floor(chunkMs / pace)));
+            }
+          }
+          ws.send(JSON.stringify({ event: "stop", streamSid: localStreamSid }));
+          setState({ kind: "done", msg: "送信完了" });
+          ws.close();
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      };
+      ws.onerror = (err) => reject(err);
+    });
+  }
 
   useEffect(() => {
     // unmount cleanup: refs only（state更新はしない）
@@ -330,6 +428,26 @@ export default function SimulateCall() {
     playbackStartedRef.current = true;
   }
 
+  function saveRecentMicWav() {
+    try {
+      const chunks = recentMicPcmRef.current.flatMap((arr) => Array.from(arr));
+      if (!chunks.length) {
+        alert("最近のマイクPCMがありません");
+        return;
+      }
+      const pcm = Int16Array.from(chunks);
+      const wavBlob = pcm16ToWavBlob(pcm, 8000);
+      const url = URL.createObjectURL(wavBlob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "recent-mic.wav";
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert(`保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   function pushOutboundMulawForPlayback(mulaw: Uint8Array) {
     ensurePlaybackStream();
     const pcm = muLawToPcm16(mulaw);
@@ -346,6 +464,12 @@ export default function SimulateCall() {
 
   async function startMic() {
     if (micEnabled) return;
+    setMicError(null);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setMicError("このブラウザ/環境ではマイクを利用できません");
+      setState({ kind: "error", msg: "マイク非対応環境です" });
+      return;
+    }
     setState({ kind: "preparing", msg: "マイク許可をリクエスト中…" });
     setSentBytes(0);
     setSentChunks(0);
@@ -355,6 +479,14 @@ export default function SimulateCall() {
     sendQueueRef.current = new Uint8Array(0);
     resampleRef.current = { buf: new Float32Array(0), pos: 0 };
     playbackStateRef.current = { buf: new Float32Array(0), pos: 0 };
+    levelAvgRef.current = [];
+    micFramesRef.current = 0;
+    zeroFramesRef.current = 0;
+    recentMicPcmRef.current = [];
+    setMicFrames(0);
+    setLastMicAt(null);
+    setRawPeak(0);
+    setZeroFrames(0);
 
     if (outWavUrl) URL.revokeObjectURL(outWavUrl);
     if (outMulawUrl) URL.revokeObjectURL(outMulawUrl);
@@ -362,17 +494,24 @@ export default function SimulateCall() {
     setOutMulawUrl(null);
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const constraints: MediaStreamConstraints = {
         audio: {
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false,
-        } as any,
-      });
+          ...(selectedDeviceId ? { deviceId: { exact: selectedDeviceId } } : {}),
+        },
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       micStreamRef.current = stream;
 
       const captureCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       captureCtxRef.current = captureCtx;
+      try {
+        await captureCtx.resume();
+      } catch {
+        // ignore
+      }
 
       // Playback context init (so first audio starts quickly)
       ensurePlaybackCtx();
@@ -395,8 +534,37 @@ export default function SimulateCall() {
       proc.onaudioprocess = (ev) => {
         try {
           const input = ev.inputBuffer.getChannelData(0);
+          let peakRaw = 0;
+          for (let i = 0; i < input.length; i++) {
+            const v = Math.abs(input[i]);
+            if (v > peakRaw) peakRaw = v;
+          }
+          setRawPeak(Math.min(1, peakRaw));
           const pcm8k = resampleTo8kLinear(input, captureCtx.sampleRate, resampleRef.current);
           if (!pcm8k.length) return;
+          // meter from resampled PCM (same data as送信)
+          let peak = 0;
+          for (let i = 0; i < pcm8k.length; i++) {
+            const v = Math.abs(pcm8k[i]) / 32768;
+            if (v > peak) peak = v;
+          }
+          levelAvgRef.current.push(peak);
+          if (levelAvgRef.current.length > 8) levelAvgRef.current.shift();
+          const avg = levelAvgRef.current.reduce((a, b) => a + b, 0) / levelAvgRef.current.length;
+          setAudioLevel(Math.min(1, avg));
+          micFramesRef.current += 1;
+          recentMicPcmRef.current.push(Int16Array.from(pcm8k));
+          const keep = 50; // ~1s if chunkMs=20
+          if (recentMicPcmRef.current.length > keep) recentMicPcmRef.current.shift();
+          if (peak < 0.0005) {
+            zeroFramesRef.current += 1;
+            if (zeroFramesRef.current % 10 === 0) setZeroFrames(zeroFramesRef.current);
+          }
+          if (micFramesRef.current % 5 === 0) {
+            setMicFrames(micFramesRef.current);
+            setLastMicAt(Date.now());
+          }
+
           const mulaw = pcm16ToMuLaw(pcm8k);
           appendToSendQueue(mulaw);
         } catch {
@@ -434,7 +602,12 @@ export default function SimulateCall() {
       setMicEnabled(true);
     } catch (e: any) {
       await stopMic();
-      setState({ kind: "error", msg: e?.message ? `開始できません: ${e.message}` : "開始できません" });
+      const msg = e?.name === "NotAllowedError"
+        ? "マイク利用が拒否されました。ブラウザの権限を確認してください。"
+        : e?.message || "開始できません";
+      setMicError(msg);
+      setState({ kind: "error", msg });
+      loadDevices().catch(() => {});
     }
   }
 
@@ -576,6 +749,28 @@ export default function SimulateCall() {
             <input className="simInput mono" value={streamSid} onChange={(e) => setStreamSid(e.target.value)} />
           </label>
 
+          <label className="simField">
+            <div className="simLabel">マイクデバイス</div>
+            <div className="deviceRow">
+              <select
+                className="simInput"
+                value={selectedDeviceId}
+                onChange={(e) => setSelectedDeviceId(e.target.value)}
+              >
+                {devices.map((d) => (
+                  <option key={d.deviceId} value={d.deviceId}>
+                    {d.label || `input ${d.deviceId.slice(0, 6)}`}
+                  </option>
+                ))}
+                {!devices.length ? <option value="">(取得できませんでした)</option> : null}
+              </select>
+              <button className="simBtn inlineBtn" onClick={() => loadDevices()}>
+                再取得
+              </button>
+            </div>
+            <div className="simHelp">※権限許可後にデバイス名が表示されます</div>
+          </label>
+
           <div className="simRow">
             <label className="simField">
               <div className="simLabel">chunkBytes</div>
@@ -643,7 +838,27 @@ export default function SimulateCall() {
           <div className="simStatus">
             <span className={`simPill ${state.kind}`}>{state.kind}</span>
             <span className="muted">{state.msg}</span>
+            {micError ? <div className="danger">{micError}</div> : null}
           </div>
+        </div>
+
+        <div className="panelDivider" />
+
+        <div className="panelTitle">音声ファイル送信</div>
+        <div className="simGrid">
+          <label className="simField">
+            <div className="simLabel">音声ファイル (wav/mp3等)</div>
+            <input
+              className="simInput"
+              type="file"
+              accept="audio/*"
+              onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
+            />
+          </label>
+          <button className="simBtn" onClick={sendFileAsCall} disabled={!selectedFile}>
+            選択ファイルを送信
+          </button>
+          {fileModeMessage ? <div className="muted">{fileModeMessage}</div> : null}
         </div>
 
         <div className="panelDivider" />
@@ -653,6 +868,19 @@ export default function SimulateCall() {
           <div className="muted">sent chunks={sentChunks} / bytes={sentBytes}</div>
           <div className="muted">
             outbound chunks={outboundChunks} / bytes={outboundBytes}
+          </div>
+          <div className="muted micLevel">
+            mic level <span className="mono">{(audioLevel * 100).toFixed(0)}%</span>
+            <div className="levelBar">
+              <div className="levelFill" style={{ width: `${Math.min(100, audioLevel * 100)}%` }} />
+            </div>
+            <div className="muted">
+              mic frames={micFrames} {lastMicAt ? `(last ${(Date.now() - lastMicAt) / 1000}s ago)` : ""}
+            </div>
+            <div className="muted">
+              raw peak={(rawPeak * 100).toFixed(1)}% / near-zero frames={zeroFrames}
+              <button className="simBtn inlineBtn" onClick={saveRecentMicWav}>最近のマイク音声を保存</button>
+            </div>
           </div>
 
           <div className="panelDivider" />
@@ -734,5 +962,3 @@ function mergeChunks(chunks: Uint8Array[]): Uint8Array {
   }
   return out;
 }
-
-

@@ -1,13 +1,15 @@
 import * as admin from "firebase-admin";
 import { OpenAI } from "openai";
-import { WebClient } from "@slack/web-api";
+import twilio from "twilio";
+import { sendSlackSummaryMessage } from "./slack-notifier";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || "";
-const SLACK_CHANNEL_ID = process.env.SLACK_CHANNEL_ID || "";
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const SMS_FROM_NUMBER = process.env.SMS_FROM_NUMBER || "";
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-const slack = new WebClient(SLACK_BOT_TOKEN);
+const twilioClient = TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
 export async function processCallSummary(callId: string, callData: any) {
   try {
@@ -60,61 +62,39 @@ export async function processCallSummary(callId: string, callData: any) {
     });
 
     // Slackに通知
-    await sendSlackNotification(callData, summary, emotion);
+    await sendSlackSummaryMessage(callData, summary, emotion);
+
+    // プロファイル更新
+    const profileId = (callData.from || "").replace(/[^0-9+]/g, "");
+    if (profileId) {
+      await db.collection("callerProfiles").doc(profileId).set(
+        {
+          lastCallId: callId,
+          lastSummary: summary,
+          lastEmotion: emotion,
+          lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastName: callData.name || "",
+        },
+        { merge: true }
+      );
+    }
+
+    // 伝言URLをSMS送付（設定がある場合のみ）
+    if (twilioClient && SMS_FROM_NUMBER && callData.from) {
+      try {
+        const messageText = `通話内容を受け付けました（ID: ${callId}）。担当者から折り返します。`;
+        await twilioClient.messages.create({
+          to: callData.from,
+          from: SMS_FROM_NUMBER,
+          body: messageText,
+        });
+      } catch (error) {
+        console.error("Error sending SMS:", error);
+      }
+    }
   } catch (error) {
     console.error("Error processing call summary:", error);
   }
 }
-
-async function sendSlackNotification(callData: any, summary: string, emotion: string) {
-  try {
-    const message = {
-      channel: SLACK_CHANNEL_ID,
-      text: "新しい通話が終了しました",
-      blocks: [
-        {
-          type: "header",
-          text: {
-            type: "plain_text",
-            text: "📞 通話終了通知",
-          },
-        },
-        {
-          type: "section",
-          fields: [
-            {
-              type: "mrkdwn",
-              text: `*電話番号:*\n${callData.from || "不明"}`,
-            },
-            {
-              type: "mrkdwn",
-              text: `*名前:*\n${callData.name || "不明"}`,
-            },
-          ],
-        },
-        {
-          type: "section",
-          text: {
-            type: "mrkdwn",
-            text: `*要約:*\n${summary}`,
-          },
-        },
-        {
-          type: "section",
-          text: {
-            type: "mrkdwn",
-            text: `*感情分析:*\n${emotion}`,
-          },
-        },
-      ],
-    };
-    await slack.chat.postMessage(message);
-  } catch (error) {
-    console.error("Error sending Slack notification:", error);
-  }
-}
-
-
-
 
 
