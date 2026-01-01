@@ -467,6 +467,8 @@ const FILLER_TEXT_THINKING = "はい、ありがとうございます。AIが思
 // 目的（伝言など）を引き出せたら、この定型文でクロージングに誘導
 const CLOSING_TEXT = "他にご用件はありますか？特になければ、このままお電話をお切りください。";
 
+const RECORD_CALLS = String(process.env.RECORD_CALLS || "false").toLowerCase() === "true";
+
 function detectNoMoreRequests(text) {
   const t = (text || "").trim();
   if (!t) return false;
@@ -668,6 +670,7 @@ async function finalizeCallSession(session, reason) {
   if (!session || !session.callSid) return;
   if (session._endedLogged) return;
   session._endedLogged = true;
+  await saveRecordingBuffers(session);
   await flushRealtimeTranscriptNow(session, true);
   await markCallStatus(session.callSid, "ended", {
     endTime: Timestamp.now(),
@@ -1204,6 +1207,10 @@ async function handleInboundMediaMessage(session, message) {
   // base64デコードしてmu-lawデータを取得
   const audioData = Buffer.from(payload, "base64");
 
+  if (RECORD_CALLS && session._recordInbound) {
+    session._recordInbound.push(audioData);
+  }
+
   // リアルタイム文字起こし用に常時投入（VAD/挨拶中の抑制とは独立）
   if (session.callSid) {
     writeRealtimeSttAudio(session, audioData);
@@ -1532,11 +1539,11 @@ async function sendAudioViaWebSocket(session, mulawBuffer) {
   
         const start = i * chunkSize;
         const end = Math.min(start + chunkSize, mulawBuffer.length);
-      const chunk = mulawBuffer.slice(start, end);
+        const chunk = mulawBuffer.slice(start, end);
       
-      // 各チャンクをbase64エンコード
-      const base64Payload = chunk.toString("base64");
-  
+        // 各チャンクをbase64エンコード
+        const base64Payload = chunk.toString("base64");
+
         const mediaMessage = {
           event: "media",
           streamSid: streamSid,
@@ -1544,8 +1551,11 @@ async function sendAudioViaWebSocket(session, mulawBuffer) {
             payload: base64Payload,
           },
         };
-  
+
         session.ws.send(JSON.stringify(mediaMessage));
+        if (RECORD_CALLS && session._recordOutbound) {
+          session._recordOutbound.push(chunk);
+        }
         sentChunks++;
         if (i === 0) {
           const now = Date.now();
@@ -1634,6 +1644,32 @@ function rememberAssistantTextBeforeStop(session) {
     session._lastAssistantText = "";
   } catch {
     // ignore
+  }
+}
+
+async function saveRecordingBuffers(session) {
+  if (!RECORD_CALLS) return;
+  if (!session || !session.callSid || !bucket) return;
+  try {
+    const inbound = session._recordInbound || [];
+    const outbound = session._recordOutbound || [];
+    const inboundBuf = inbound.length ? Buffer.concat(inbound) : null;
+    const outboundBuf = outbound.length ? Buffer.concat(outbound) : null;
+    const tasks = [];
+    if (inboundBuf && inboundBuf.length > 0) {
+      const f = bucket.file(`recordings/${session.callSid}/inbound.ulaw`);
+      tasks.push(f.save(inboundBuf, { contentType: "audio/basic" }));
+    }
+    if (outboundBuf && outboundBuf.length > 0) {
+      const f = bucket.file(`recordings/${session.callSid}/outbound.ulaw`);
+      tasks.push(f.save(outboundBuf, { contentType: "audio/basic" }));
+    }
+    if (tasks.length) {
+      await Promise.all(tasks);
+      console.log(`[REC] saved call=${session.callSid} inboundBytes=${inboundBuf?.length || 0} outboundBytes=${outboundBuf?.length || 0}`);
+    }
+  } catch (e) {
+    console.warn(`[REC] save_failed call=${session?.callSid || "unknown"} err=${e.message}`);
   }
 }
 
@@ -2185,6 +2221,8 @@ function initializeSession(callSid, ws) {
     _mediaFramesReceived: 0,
     _mediaBytesReceived: 0,
     _lastAudioHeartbeat: 0,
+    _recordInbound: [],
+    _recordOutbound: [],
   };
 
   // streamSidが準備できたときのコールバックを設定
@@ -2256,6 +2294,8 @@ wss.on("connection", async (ws, req) => {
       _mediaFramesReceived: 0,
       _mediaBytesReceived: 0,
       _lastAudioHeartbeat: 0,
+      _recordInbound: [],
+      _recordOutbound: [],
     };
   } else {
     console.log(`[WS] WebSocket connection established for call ${callSid}`);
