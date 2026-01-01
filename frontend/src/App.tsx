@@ -325,42 +325,77 @@ export default function App() {
                       <div className="msgText">{m.content}</div>
                     </div>
                   ))}
-                  {(selected.data.conversations || []).length === 0 ? (
-                    <div className="empty">会話ログがまだありません</div>
-                  ) : null}
-                </div>
+              {(selected.data.conversations || []).length === 0 ? (
+                <div className="empty">会話ログがまだありません</div>
+              ) : null}
+            </div>
 
-              {selected.data.realtimeTranscript ||
-              selected.data.realtimeTranscriptInterim ||
-              selected.data.realtimeAssistantUtterances?.length ? (
+            {(() => {
+              const toMillis = (t?: Timestamp) => (t && typeof t.toMillis === "function" ? t.toMillis() : 0);
+              const timeline: Array<{
+                role: "user" | "assistant";
+                label?: string;
+                content: string;
+                time: number;
+              }> = [];
+
+              (selected.data.conversations || []).forEach((m) => {
+                if (!m?.content) return;
+                timeline.push({
+                  role: m.role || "user",
+                  label: m.label,
+                  content: m.content,
+                  time: toMillis(m.timestamp),
+                });
+              });
+
+              (selected.data.realtimeAssistantUtterances || []).forEach((m) => {
+                if (!m?.content) return;
+                timeline.push({
+                  role: "assistant",
+                  label: m.label ? `rt:${m.label}` : "rt",
+                  content: m.content || "",
+                  time: toMillis(m.timestamp),
+                });
+              });
+
+              if (selected.data.realtimeTranscript) {
+                timeline.push({
+                  role: "user",
+                  label: "rt final",
+                  content: selected.data.realtimeTranscript,
+                  time: toMillis(selected.data.realtimeTranscriptUpdatedAt),
+                });
+              }
+              if (selected.data.realtimeTranscriptInterim) {
+                timeline.push({
+                  role: "user",
+                  label: "rt interim",
+                  content: selected.data.realtimeTranscriptInterim,
+                  time: toMillis(selected.data.realtimeTranscriptUpdatedAt) + 0.5,
+                });
+              }
+
+              const recent = timeline
+                .filter((m) => m.content?.trim())
+                .sort((a, b) => a.time - b.time)
+                .slice(-60);
+
+              return recent.length ? (
                 <>
                   <div className="panelDivider" />
                   <div className="panelTitle">リアルタイム文字起こし（顧客 + AI）</div>
-                  {selected.data.realtimeTranscript ? (
-                    <div className="msg user">
-                      <div className="msgRole">user (rt final)</div>
-                      <div className="msgText">{selected.data.realtimeTranscript}</div>
-                    </div>
-                  ) : null}
-                  {selected.data.realtimeTranscriptInterim ? (
-                    <div className="msg user">
-                      <div className="msgRole">user (rt interim)</div>
-                      <div className="msgText">{selected.data.realtimeTranscriptInterim}</div>
-                    </div>
-                  ) : null}
-
-                  {selected.data.realtimeAssistantUtterances?.length ? (
-                    <div className="chat">
-                      {selected.data.realtimeAssistantUtterances.slice(-30).map((m, idx) => (
-                        <div key={idx} className="msg assistant">
-                          <div className="msgRole">{`assistant (rt${m.label ? `:${m.label}` : ""})`}</div>
-                          <div className="msgText">{m.content || ""}</div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
+                  <div className="chat">
+                    {recent.map((m, idx) => (
+                      <div key={`${m.role}-${idx}-${m.time}`} className={`msg ${m.role}`}>
+                        <div className="msgRole">{`${m.role}${m.label ? ` (${m.label})` : ""}`}</div>
+                        <div className="msgText">{m.content}</div>
+                      </div>
+                    ))}
+                  </div>
                 </>
-              ) : null}
+              ) : null;
+            })()}
               </div>
             )}
           </section>
