@@ -48,6 +48,19 @@ type CallDoc = {
   realtimeAssistantUpdatedAt?: Timestamp;
 };
 
+type RealtimeChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+  label?: string;
+  time?: number;
+  kind: "conversation" | "rt_final" | "rt_interim" | "rt_assistant";
+  interim?: boolean;
+};
+
+function toMillis(t?: Timestamp) {
+  return t && typeof t.toMillis === "function" ? t.toMillis() : 0;
+}
+
 export default function App() {
   const { cfg, hasProjectId } = useMemo(() => getFirebaseWebConfigFromEnvOrDefault(), []);
   const [calls, setCalls] = useState<Array<{ id: string; data: CallDoc }>>([]);
@@ -62,6 +75,102 @@ export default function App() {
   const [manualText, setManualText] = useState("");
   const [aiToggleStatus, setAiToggleStatus] = useState<string | null>(null);
   const [manualStatus, setManualStatus] = useState<string | null>(null);
+
+  const selected = calls.find((c) => c.id === selectedId);
+  const realtimeChat = useMemo<RealtimeChatMessage[]>(() => {
+    if (!selected) return [];
+    const data = selected.data || {};
+    const now = Date.now();
+
+    const conversationMessages: RealtimeChatMessage[] = (data.conversations || []).map((m) => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: m.content,
+      label: m.label,
+      time: toMillis(m.timestamp),
+      kind: "conversation",
+      interim: false,
+    }));
+
+    const conversationKeys = new Set(
+      conversationMessages
+        .filter((m) => m.content?.trim())
+        .map((m) => `${m.role}::${m.content.trim()}`)
+    );
+
+    const timeline: RealtimeChatMessage[] = [...conversationMessages];
+
+    (data.realtimeAssistantUtterances || []).forEach((m) => {
+      const content = String(m?.content || "").trim();
+      if (!content) return;
+      const key = `assistant::${content}`;
+      if (conversationKeys.has(key)) return;
+      timeline.push({
+        role: "assistant",
+        content,
+        label: m?.label ? `rt:${m.label}` : "rt",
+        time: toMillis(m?.timestamp) || toMillis(data.realtimeAssistantUpdatedAt),
+        kind: "rt_assistant",
+        interim: false,
+      });
+    });
+
+    const rtUpdatedAt = toMillis(data.realtimeTranscriptUpdatedAt) || now;
+    const rtFinal = String(data.realtimeTranscript || "").trim();
+    if (rtFinal && !conversationKeys.has(`user::${rtFinal}`)) {
+      timeline.push({
+        role: "user",
+        content: rtFinal,
+        label: "rt final",
+        time: rtUpdatedAt,
+        kind: "rt_final",
+        interim: false,
+      });
+    }
+
+    const rtInterim = String(data.realtimeTranscriptInterim || "").trim();
+    if (rtInterim) {
+      timeline.push({
+        role: "user",
+        content: rtInterim,
+        label: "rt interim",
+        time: rtUpdatedAt + 0.5,
+        kind: "rt_interim",
+        interim: true,
+      });
+    }
+
+    const sorted = timeline
+      .filter((m) => m.content?.trim())
+      .sort((a, b) => (a.time || 0) - (b.time || 0));
+
+    const deduped: RealtimeChatMessage[] = [];
+    const seenNonInterim = new Set<string>();
+    let lastInterimIndex = -1;
+
+    sorted.forEach((msg) => {
+      if (msg.kind === "rt_interim") {
+        if (lastInterimIndex >= 0) {
+          deduped.splice(lastInterimIndex, 1);
+        }
+        deduped.push(msg);
+        lastInterimIndex = deduped.length - 1;
+        return;
+      }
+
+      const key = `${msg.role}::${msg.content}::${msg.kind}`;
+      if (seenNonInterim.has(key)) return;
+      seenNonInterim.add(key);
+      deduped.push(msg);
+    });
+
+    return deduped.slice(-120);
+  }, [selected]);
+
+  const formatTime = (ms?: number) => {
+    if (!ms) return "";
+    const d = new Date(ms);
+    return d.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  };
 
   useEffect(() => {
     if (!hasProjectId) return;
@@ -84,7 +193,6 @@ export default function App() {
     }
   }, [cfg, hasProjectId, selectedId]);
 
-  const selected = calls.find((c) => c.id === selectedId);
   useEffect(() => {
     if (!selected) return;
     if (typeof selected.data.aiResponseEnabled === "boolean") {
@@ -325,77 +433,32 @@ export default function App() {
                       <div className="msgText">{m.content}</div>
                     </div>
                   ))}
-              {(selected.data.conversations || []).length === 0 ? (
-                <div className="empty">会話ログがまだありません</div>
-              ) : null}
-            </div>
+                  {(selected.data.conversations || []).length === 0 ? (
+                    <div className="empty">会話ログがまだありません</div>
+                  ) : null}
+                </div>
 
-            {(() => {
-              const toMillis = (t?: Timestamp) => (t && typeof t.toMillis === "function" ? t.toMillis() : 0);
-              const timeline: Array<{
-                role: "user" | "assistant";
-                label?: string;
-                content: string;
-                time: number;
-              }> = [];
-
-              (selected.data.conversations || []).forEach((m) => {
-                if (!m?.content) return;
-                timeline.push({
-                  role: m.role || "user",
-                  label: m.label,
-                  content: m.content,
-                  time: toMillis(m.timestamp),
-                });
-              });
-
-              (selected.data.realtimeAssistantUtterances || []).forEach((m) => {
-                if (!m?.content) return;
-                timeline.push({
-                  role: "assistant",
-                  label: m.label ? `rt:${m.label}` : "rt",
-                  content: m.content || "",
-                  time: toMillis(m.timestamp),
-                });
-              });
-
-              if (selected.data.realtimeTranscript) {
-                timeline.push({
-                  role: "user",
-                  label: "rt final",
-                  content: selected.data.realtimeTranscript,
-                  time: toMillis(selected.data.realtimeTranscriptUpdatedAt),
-                });
-              }
-              if (selected.data.realtimeTranscriptInterim) {
-                timeline.push({
-                  role: "user",
-                  label: "rt interim",
-                  content: selected.data.realtimeTranscriptInterim,
-                  time: toMillis(selected.data.realtimeTranscriptUpdatedAt) + 0.5,
-                });
-              }
-
-              const recent = timeline
-                .filter((m) => m.content?.trim())
-                .sort((a, b) => a.time - b.time)
-                .slice(-60);
-
-              return recent.length ? (
-                <>
-                  <div className="panelDivider" />
-                  <div className="panelTitle">リアルタイム文字起こし（顧客 + AI）</div>
-                  <div className="chat">
-                    {recent.map((m, idx) => (
-                      <div key={`${m.role}-${idx}-${m.time}`} className={`msg ${m.role}`}>
-                        <div className="msgRole">{`${m.role}${m.label ? ` (${m.label})` : ""}`}</div>
-                        <div className="msgText">{m.content}</div>
-                      </div>
-                    ))}
-                  </div>
-                </>
-              ) : null;
-            })()}
+                {realtimeChat.length ? (
+                  <>
+                    <div className="panelDivider" />
+                    <div className="panelTitle">リアルタイム文字起こし（チャット表示）</div>
+                    <div className="chatStream">
+                      {realtimeChat.map((m, idx) => (
+                        <div
+                          key={`${m.role}-${m.time || idx}-${m.kind}-${idx}`}
+                          className={`chatBubble ${m.role} ${m.interim ? "interim" : ""}`}
+                        >
+                          <div className="chatMeta">
+                            <span className="chatRole">{m.role === "assistant" ? "AI" : "顧客"}</span>
+                            {m.label ? <span className="chatLabel">{m.label}</span> : null}
+                            {m.time ? <span className="chatTime">{formatTime(m.time)}</span> : null}
+                          </div>
+                          <div className="chatText">{m.content}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                ) : null}
               </div>
             )}
           </section>

@@ -248,6 +248,74 @@
   line-height: 1.5;
 }
 
+.chatStream {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 10px;
+}
+
+.chatBubble {
+  max-width: 88%;
+  align-self: flex-start;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgba(10, 16, 34, 0.6);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+
+.chatBubble.assistant {
+  align-self: flex-start;
+  border-color: rgba(255, 255, 255, 0.16);
+  background: linear-gradient(135deg, rgba(12, 18, 36, 0.8), rgba(20, 32, 68, 0.8));
+}
+
+.chatBubble.user {
+  align-self: flex-end;
+  border-color: rgba(122, 167, 255, 0.35);
+  background: linear-gradient(135deg, rgba(18, 28, 54, 0.85), rgba(25, 43, 90, 0.9));
+}
+
+.chatBubble.interim {
+  border-style: dashed;
+  opacity: 0.85;
+}
+
+.chatMeta {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.chatRole {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.chatLabel {
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  font-size: 10px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.chatTime {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.chatText {
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+
 .empty {
   padding: 14px;
   color: var(--muted);
