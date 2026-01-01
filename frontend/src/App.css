@@ -124,6 +124,16 @@
   background: linear-gradient(90deg, #4caf50, #ff9800);
 }
 
+.deviceRow {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.inlineBtn {
+  padding: 6px 10px;
+}
+
 .panelDivider {
   height: 1px;
   background: var(--border);
@@ -376,4 +386,3 @@
     grid-template-columns: 1fr 1fr;
   }
 }
-

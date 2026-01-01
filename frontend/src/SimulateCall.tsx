@@ -102,6 +102,8 @@ export default function SimulateCall() {
   const [lastMicAt, setLastMicAt] = useState<number | null>(null);
   const [rawPeak, setRawPeak] = useState(0);
   const [zeroFrames, setZeroFrames] = useState(0);
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>("");
 
   const [micEnabled, setMicEnabled] = useState(false);
   const [sentChunks, setSentChunks] = useState(0);
@@ -139,6 +141,7 @@ export default function SimulateCall() {
   const micFramesRef = useRef(0);
   const zeroFramesRef = useRef(0);
   const recentMicPcmRef = useRef<Int16Array[]>([]);
+  const deviceLoadInFlightRef = useRef(false);
 
   const wsUrlAuto = useMemo(() => {
     // Hosting(owldial.web.app) は WebSocket の upgrade を扱えないため、
@@ -176,6 +179,28 @@ export default function SimulateCall() {
     // wsUrl が未入力のときだけ自動補完（手入力を上書きしない）
     setWsUrl((prev) => prev || wsUrlAuto);
   }, [wsUrlAuto]);
+
+  async function loadDevices() {
+    if (deviceLoadInFlightRef.current) return;
+    deviceLoadInFlightRef.current = true;
+    try {
+      if (!navigator.mediaDevices?.enumerateDevices) return;
+      const list = await navigator.mediaDevices.enumerateDevices();
+      const inputs = list.filter((d) => d.kind === "audioinput");
+      setDevices(inputs);
+      if (!selectedDeviceId && inputs[0]) {
+        setSelectedDeviceId(inputs[0].deviceId);
+      }
+    } catch {
+      // ignore
+    } finally {
+      deviceLoadInFlightRef.current = false;
+    }
+  }
+
+  useEffect(() => {
+    loadDevices();
+  }, []);
 
   async function sendFileAsCall() {
     if (!selectedFile) {
@@ -469,13 +494,15 @@ export default function SimulateCall() {
     setOutMulawUrl(null);
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const constraints: MediaStreamConstraints = {
         audio: {
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false,
-        } as any,
-      });
+          ...(selectedDeviceId ? { deviceId: { exact: selectedDeviceId } } : {}),
+        },
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       micStreamRef.current = stream;
 
       const captureCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
@@ -580,6 +607,7 @@ export default function SimulateCall() {
         : e?.message || "開始できません";
       setMicError(msg);
       setState({ kind: "error", msg });
+      loadDevices().catch(() => {});
     }
   }
 
@@ -719,6 +747,28 @@ export default function SimulateCall() {
           <label className="simField">
             <div className="simLabel">streamSid</div>
             <input className="simInput mono" value={streamSid} onChange={(e) => setStreamSid(e.target.value)} />
+          </label>
+
+          <label className="simField">
+            <div className="simLabel">マイクデバイス</div>
+            <div className="deviceRow">
+              <select
+                className="simInput"
+                value={selectedDeviceId}
+                onChange={(e) => setSelectedDeviceId(e.target.value)}
+              >
+                {devices.map((d) => (
+                  <option key={d.deviceId} value={d.deviceId}>
+                    {d.label || `input ${d.deviceId.slice(0, 6)}`}
+                  </option>
+                ))}
+                {!devices.length ? <option value="">(取得できませんでした)</option> : null}
+              </select>
+              <button className="simBtn inlineBtn" onClick={() => loadDevices()}>
+                再取得
+              </button>
+            </div>
+            <div className="simHelp">※権限許可後にデバイス名が表示されます</div>
           </label>
 
           <div className="simRow">
