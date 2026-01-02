@@ -599,6 +599,39 @@ function buildResponseWithName(session, baseText) {
   return `${name}さん、${baseText}`;
 }
 
+function appendRepeatHint(text) {
+  const hint = "繰り返しが必要なときは「繰り返して」とお知らせください。";
+  const t = (text || "").trim();
+  if (!t) return hint;
+  if (t.includes(hint)) return t;
+  return `${t} ${hint}`;
+}
+
+function isRepeatRequest(text) {
+  const normalized = (text || "").replace(/\s+/g, "");
+  return normalized.includes("繰り返して");
+}
+
+function rememberAssistantMessage(session, text) {
+  try {
+    if (!session) return;
+    session._lastAssistantMessage = (text || "").trim();
+    if (!session._lastAssistantMessage && session._lastAssistantText) {
+      session._lastAssistantMessage = session._lastAssistantText;
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function getLastAssistantMessage(session) {
+  try {
+    return (session?._lastAssistantMessage || session?._lastAssistantText || "").trim();
+  } catch {
+    return "";
+  }
+}
+
 function shouldClarifyTranscript(session, text) {
   const meta = session?._lastTranscriptMeta || {};
   const len = (text || "").trim().length;
@@ -1764,7 +1797,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     // 空転写/エラーは会話履歴に入れず、再度話してもらう
     if (!userMessage) {
       console.warn(`[AUDIO-IN] Empty transcription for call ${callSid}`);
-      await sendAudioResponseViaMediaStream(session, "すみません、少し聞き取れませんでした。もう一度お願いできますか？");
+      await sendAudioResponseViaMediaStream(session, appendRepeatHint("すみません、少し聞き取れませんでした。もう一度お願いできますか？"));
       continue;
     }
 
@@ -1790,8 +1823,35 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     );
     console.log(`[LAT] firestore_user_update call=${callSid} dt=${Date.now() - tFs1}ms total=${Date.now() - t0}ms`);
 
+    if (isRepeatRequest(userMessage)) {
+      const lastAssistant = getLastAssistantMessage(session);
+      const repeatBase = lastAssistant
+        ? `繰り返します。${lastAssistant}`
+        : buildResponseWithName(session, "直前の案内がありません。もう一度ご用件をお聞かせいただけますか？");
+      const repeatResponse = appendRepeatHint(repeatBase);
+      console.log(`[FLOW] repeat_request call=${callSid} hasPrevious=${Boolean(lastAssistant)}`);
+      appendAssistantRealtimeText(session, repeatResponse, "repeat", false).catch(() => {});
+      const tFsRepeat = Date.now();
+      await callRef.set(
+        {
+          updatedAt: Timestamp.now(),
+          conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
+            role: "assistant",
+            content: repeatResponse,
+            timestamp: Timestamp.now(),
+          }),
+        },
+        { merge: true }
+      );
+      console.log(`[LAT] firestore_assistant_update call=${callSid} dt=${Date.now() - tFsRepeat}ms total=${Date.now() - t0}ms`);
+      const tSendRepeat = Date.now();
+      await sendAudioResponseViaMediaStream(session, repeatResponse);
+      console.log(`[LAT] send_audio_done call=${callSid} dt=${Date.now() - tSendRepeat}ms total=${Date.now() - t0}ms`);
+      continue;
+    }
+
     if (shouldClarifyTranscript(session, userMessage)) {
-      const clarify = buildResponseWithName(session, "少しお声が小さかったようです。念のため、ご用件とお名前をもう一度はっきりお聞かせいただけますか？");
+      const clarify = appendRepeatHint(buildResponseWithName(session, "少しお声が小さかったようです。念のため、ご用件とお名前をもう一度はっきりお聞かせいただけますか？"));
       session._lastClarifyAt = Date.now();
       appendAssistantRealtimeText(session, clarify, "clarify", false).catch(() => {});
       const tFsClarify = Date.now();
@@ -1823,7 +1883,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     console.log(`[FLOW] intent call=${callSid} action=${cls.action} reason=${cls.reason}`);
 
     if (cls.action === "farewell") {
-      const farewell = buildResponseWithName(session, "承知しました。失礼いたします。");
+      const farewell = appendRepeatHint(buildResponseWithName(session, "承知しました。失礼いたします。"));
       console.log(`[FLOW] farewell call=${callSid}`);
       appendAssistantRealtimeText(session, farewell, "farewell", false).catch(() => {});
       const tFs2 = Date.now();
@@ -1846,7 +1906,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     }
 
     if (cls.action === "take_message") {
-      const prompt = buildResponseWithName(session, "恐れ入りますが担当者へお繋ぎできません。伝言として承りますので、ご用件と、お名前・折り返し先（電話番号）をお話しください。");
+      const prompt = appendRepeatHint(buildResponseWithName(session, "恐れ入りますが担当者へお繋ぎできません。伝言として承りますので、ご用件と、お名前・折り返し先（電話番号）をお話しください。"));
       console.log(`[FLOW] take_message call=${callSid}`);
       appendAssistantRealtimeText(session, prompt, "take_message", false).catch(() => {});
       const tFs2 = Date.now();
@@ -1882,7 +1942,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
         }, { merge: true });
       } catch (_) {}
 
-      const closing = buildResponseWithName(session, `承知しました。${CLOSING_TEXT}`);
+      const closing = appendRepeatHint(buildResponseWithName(session, `承知しました。${CLOSING_TEXT}`));
       appendAssistantRealtimeText(session, closing, "closing", false).catch(() => {});
       const tFs2 = Date.now();
       await callRef.set(
@@ -1905,7 +1965,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
 
     // フォールバック（分類失敗時）: 既存の簡易判定
     if (session._closingAsked && detectNoMoreRequests(userMessage)) {
-      const farewell = buildResponseWithName(session, "承知しました。失礼いたします。");
+      const farewell = appendRepeatHint(buildResponseWithName(session, "承知しました。失礼いたします。"));
       console.log(`[FLOW] no_more_requests_fallback call=${callSid}`);
       appendAssistantRealtimeText(session, farewell, "farewell", false).catch(() => {});
       const tFs2 = Date.now();
@@ -1971,6 +2031,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       aiResponse = aiResponse.slice(0, maxChars).trimEnd() + "…";
     }
     console.log(`[AUDIO-IN] AI response for call ${callSid}: ${aiResponse}`);
+    aiResponse = appendRepeatHint(aiResponse);
     appendAssistantRealtimeText(session, aiResponse, "ai_response", false).catch(() => {});
     
     // FirestoreにAI返答を保存
@@ -2512,6 +2573,7 @@ async function sendAudioResponseViaMediaStream(session, text) {
   const callSid = session.callSid;
   console.log(`[AUDIO] Generating audio response for call ${callSid}: ${text}`);
   const t0 = Date.now();
+  rememberAssistantMessage(session, text);
 
   try {
     // Firestoreから音声設定を取得
