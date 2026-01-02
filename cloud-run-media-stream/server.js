@@ -632,6 +632,46 @@ function getLastAssistantMessage(session) {
   }
 }
 
+function toMillisAdmin(t) {
+  return t && typeof t.toMillis === "function" ? t.toMillis() : 0;
+}
+
+function buildFullChatHistory(callData) {
+  const conv = Array.isArray(callData?.conversations) ? callData.conversations : [];
+  const rtAssistant = Array.isArray(callData?.realtimeAssistantUtterances) ? callData.realtimeAssistantUtterances : [];
+  const rtFinal = String(callData?.realtimeTranscript || "").trim();
+
+  const history = [];
+  conv.forEach((m, idx) => {
+    const role = m?.role === "user" ? "user" : "assistant";
+    const content = String(m?.content || "").trim();
+    if (!content) return;
+    history.push({ role, content, time: toMillisAdmin(m?.timestamp) || idx });
+  });
+
+  rtAssistant.forEach((m, idx) => {
+    const content = String(m?.content || "").trim();
+    if (!content) return;
+    history.push({
+      role: "assistant",
+      content,
+      time: toMillisAdmin(m?.timestamp) || (conv.length + idx + 0.1),
+    });
+  });
+
+  if (rtFinal) {
+    history.push({
+      role: "user",
+      content: rtFinal,
+      time: toMillisAdmin(callData?.realtimeTranscriptUpdatedAt) || (conv.length + rtAssistant.length + 0.2),
+    });
+  }
+
+  return history
+    .filter((m) => m.content)
+    .sort((a, b) => (a.time || 0) - (b.time || 0));
+}
+
 function shouldClarifyTranscript(session, text) {
   const meta = session?._lastTranscriptMeta || {};
   const len = (text || "").trim().length;
@@ -1992,7 +2032,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     const callDoc = await callRef.get();
     console.log(`[LAT] firestore_get call=${callSid} dt=${Date.now() - tFsGet}ms total=${Date.now() - t0}ms`);
     const callData = callDoc.data();
-    const conversations = callData?.conversations || [];
+    const history = buildFullChatHistory(callData);
     if (typeof callData?.aiResponseEnabled === "boolean") {
       session._aiResponseEnabled = callData.aiResponseEnabled;
     }
@@ -2013,7 +2053,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
           role: "system",
           content: systemPrompt,
         },
-        ...conversations.slice(-10).map((c) => ({
+        ...history.map((c) => ({
           role: c.role === "user" ? "user" : "assistant",
           content: c.content,
         })),
