@@ -476,6 +476,21 @@ function detectNoMoreRequests(text) {
   return noPhrases.some(p => t.includes(p));
 }
 
+function appendRecentTurn(session, role, content) {
+  try {
+    if (!session) return;
+    if (!session._recentTurns) session._recentTurns = [];
+    const c = (content || "").trim();
+    if (!c) return;
+    session._recentTurns.push({ role, content: c });
+    if (session._recentTurns.length > 30) {
+      session._recentTurns = session._recentTurns.slice(-30);
+    }
+  } catch {
+    // ignore
+  }
+}
+
 async function classifyUserTurnWithAI(session, userMessage) {
   // 目的: 単語ベースでなく「AIが対応可能か？」で分岐する
   // - connect/transfer 等は不可 → 伝言を促す
@@ -484,6 +499,9 @@ async function classifyUserTurnWithAI(session, userMessage) {
   const payload = {
     closingAsked: Boolean(session?._closingAsked),
     userMessage: (userMessage || "").trim(),
+    recentTurns: Array.isArray(session?._recentTurns) ? session._recentTurns.slice(-8) : [],
+    hasContactInfo: Boolean(session?._hasContactInfo),
+    hasPurpose: Boolean(session?._hasPurpose),
   };
   try {
     const resp = await openai.chat.completions.create({
@@ -1862,6 +1880,14 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       { merge: true }
     );
     console.log(`[LAT] firestore_user_update call=${callSid} dt=${Date.now() - tFs1}ms total=${Date.now() - t0}ms`);
+    appendRecentTurn(session, "user", userMessage);
+    const phonePattern = /(?:0\\d{1,4}-?\\d{2,4}-?\\d{3,4}|\\d{9,})/;
+    if (phonePattern.test(userMessage) || userMessage.includes("電話") || userMessage.includes("折り返し")) {
+      session._hasContactInfo = true;
+    }
+    if (userMessage.length >= 10 || userMessage.includes("お願い") || userMessage.includes("依頼") || userMessage.includes("ご用件")) {
+      session._hasPurpose = true;
+    }
 
     if (isRepeatRequest(userMessage)) {
       const lastAssistant = getLastAssistantMessage(session);
@@ -1871,6 +1897,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       const repeatResponse = appendRepeatHint(repeatBase);
       console.log(`[FLOW] repeat_request call=${callSid} hasPrevious=${Boolean(lastAssistant)}`);
       appendAssistantRealtimeText(session, repeatResponse, "repeat", false).catch(() => {});
+      appendRecentTurn(session, "assistant", repeatResponse);
       const tFsRepeat = Date.now();
       await callRef.set(
         {
@@ -1894,6 +1921,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       const clarify = appendRepeatHint(buildResponseWithName(session, "少しお声が小さかったようです。念のため、ご用件とお名前をもう一度はっきりお聞かせいただけますか？"));
       session._lastClarifyAt = Date.now();
       appendAssistantRealtimeText(session, clarify, "clarify", false).catch(() => {});
+      appendRecentTurn(session, "assistant", clarify);
       const tFsClarify = Date.now();
       await callRef.set(
         {
@@ -1926,6 +1954,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       const farewell = appendRepeatHint(buildResponseWithName(session, "承知しました。失礼いたします。"));
       console.log(`[FLOW] farewell call=${callSid}`);
       appendAssistantRealtimeText(session, farewell, "farewell", false).catch(() => {});
+      appendRecentTurn(session, "assistant", farewell);
       const tFs2 = Date.now();
       await callRef.set(
         {
@@ -1949,6 +1978,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       const prompt = appendRepeatHint(buildResponseWithName(session, "恐れ入りますが担当者へお繋ぎできません。伝言として承りますので、ご用件と、お名前・折り返し先（電話番号）をお話しください。"));
       console.log(`[FLOW] take_message call=${callSid}`);
       appendAssistantRealtimeText(session, prompt, "take_message", false).catch(() => {});
+      appendRecentTurn(session, "assistant", prompt);
       const tFs2 = Date.now();
       await callRef.set(
         {
@@ -1984,6 +2014,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
 
       const closing = appendRepeatHint(buildResponseWithName(session, `承知しました。${CLOSING_TEXT}`));
       appendAssistantRealtimeText(session, closing, "closing", false).catch(() => {});
+      appendRecentTurn(session, "assistant", closing);
       const tFs2 = Date.now();
       await callRef.set(
         {
@@ -2008,6 +2039,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       const farewell = appendRepeatHint(buildResponseWithName(session, "承知しました。失礼いたします。"));
       console.log(`[FLOW] no_more_requests_fallback call=${callSid}`);
       appendAssistantRealtimeText(session, farewell, "farewell", false).catch(() => {});
+      appendRecentTurn(session, "assistant", farewell);
       const tFs2 = Date.now();
       await callRef.set(
         {
@@ -2073,6 +2105,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     console.log(`[AUDIO-IN] AI response for call ${callSid}: ${aiResponse}`);
     aiResponse = appendRepeatHint(aiResponse);
     appendAssistantRealtimeText(session, aiResponse, "ai_response", false).catch(() => {});
+    appendRecentTurn(session, "assistant", aiResponse);
     
     // FirestoreにAI返答を保存
     const tFs2 = Date.now();
