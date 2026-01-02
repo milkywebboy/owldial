@@ -626,9 +626,34 @@ function appendRepeatHint(text) {
   return `${t} ${hint}`;
 }
 
+function kanaToHiragana(text) {
+  return (text || "").replace(/[\u30a1-\u30f6]/g, (m) => String.fromCharCode(m.charCodeAt(0) - 0x60));
+}
+
+function normalizeForRepeatDetection(text) {
+  const t = (text || "").trim();
+  if (!t) return "";
+  const wide = t.normalize("NFKC");
+  const lower = wide.toLowerCase();
+  const noSpaces = lower.replace(/\s+/g, "");
+  return kanaToHiragana(noSpaces);
+}
+
 function isRepeatRequest(text) {
-  const normalized = (text || "").replace(/\s+/g, "");
-  return normalized.includes("繰り返して");
+  const norm = normalizeForRepeatDetection(text);
+  if (!norm) return false;
+  const patterns = [
+    "繰り返して",
+    "繰り返し",
+    "もう一度",
+    "もいちど",
+    "復唱",
+    "リピート",
+    "りぴーと",
+    "おさらい",
+    "もう一回",
+  ];
+  return patterns.some((p) => norm.includes(p));
 }
 
 function rememberAssistantMessage(session, text) {
