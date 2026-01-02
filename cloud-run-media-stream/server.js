@@ -518,6 +518,7 @@ async function classifyUserTurnWithAI(session, userMessage) {
             "判断基準: " +
             "1) 人に繋ぐ/取り次ぎ/担当者に代わる/転送 等はAIは対応不可なので action=take_message。 " +
             "2) 伝言内容や折返し先(電話番号/メール)など必要情報が十分に取れたら action=closing。 " +
+            "   payload.hasPurpose と payload.hasContactInfo が両方 true の場合は必ず action=closing にすること。 " +
             "3) closingAsked=true の後に『特にない/以上』等なら action=farewell。 " +
             "それ以外は action=normal。 " +
             "返却JSON形式: {\"action\":\"...\",\"reason\":\"...\"}",
@@ -1885,7 +1886,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     if (phonePattern.test(userMessage) || userMessage.includes("電話") || userMessage.includes("折り返し")) {
       session._hasContactInfo = true;
     }
-    if (userMessage.length >= 10 || userMessage.includes("お願い") || userMessage.includes("依頼") || userMessage.includes("ご用件")) {
+    if (userMessage.length >= 10 || userMessage.includes("お願い") || userMessage.includes("依頼") || userMessage.includes("ご用件") || userMessage.includes("リスケ") || userMessage.includes("日程")) {
       session._hasPurpose = true;
     }
 
