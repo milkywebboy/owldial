@@ -490,6 +490,20 @@ function detectNoMoreRequests(text) {
   return noPhrases.some(p => t.includes(p));
 }
 
+function buildTakeMessagePrompt(session) {
+  const nameKnown = Boolean(sanitizeCallerName(session?._callerName || ""));
+  const phoneKnown = Boolean(session?._hasContactInfo);
+  const purposeKnown = Boolean(session?._hasPurpose);
+
+  const asks = [];
+  if (!purposeKnown) asks.push("ご用件");
+  if (!nameKnown) asks.push("お名前");
+  if (!phoneKnown) asks.push("折り返し先（電話番号）");
+
+  const askText = asks.length ? `、${asks.join("・")}をお話しください。` : "。";
+  return buildResponseWithName(session, `恐れ入りますが担当者へお繋ぎできません。伝言として承りますので${askText}`);
+}
+
 function appendRecentTurn(session, role, content) {
   try {
     if (!session) return;
@@ -615,6 +629,7 @@ async function detectAndStoreCallerName(session, callRef, userMessage) {
   if (!detected || detected === currentName) return currentName;
 
   session._callerName = detected;
+  session._hasContactName = true;
   try {
     await callRef.set({
       name: detected,
@@ -2015,7 +2030,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     }
 
     if (cls.action === "take_message") {
-      const prompt = appendRepeatHint(buildResponseWithName(session, "恐れ入りますが担当者へお繋ぎできません。伝言として承りますので、ご用件と、お名前・折り返し先（電話番号）をお話しください。"));
+      const prompt = appendRepeatHint(buildTakeMessagePrompt(session));
       console.log(`[FLOW] take_message call=${callSid}`);
       appendAssistantRealtimeText(session, prompt, "take_message", false).catch(() => {});
       appendRecentTurn(session, "assistant", prompt);
