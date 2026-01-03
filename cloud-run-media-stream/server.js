@@ -192,12 +192,26 @@ function getGoogleSttSpeechContexts() {
     // 典型的な誤認識（例: 「お世話」→「朝」）を抑えるための汎用フレーズ
     "お世話になっております",
     "お世話になっております。", // punctuation付きも入れておく
+    "お世話になっております、テックファンドです",
+    "お電話ありがとうございます。テックファンドです。",
     "恐れ入ります",
     "失礼いたします",
     "承知しました",
     "伝言",
     "折り返し",
     "担当者",
+    "要件を繰り返していただけますか",
+    "要件を繰り返して",
+    "もう一度お聞かせください",
+    "もう一度お願いします",
+    "請求書の内容についてお伺いしたくお電話しました",
+    "請求書についてお伺いしたくお電話しました",
+    "請求書の内容について",
+    "請求書について",
+    "開発定例",
+    "リスケ",
+    "折り返し先は私木下宛てです",
+    "折り返し先は私 木下宛てです",
   ];
   const raw = String(process.env.GOOGLE_STT_HINTS || "").trim();
   const extra = raw
@@ -207,7 +221,7 @@ function getGoogleSttSpeechContexts() {
   const phrases = Array.from(new Set([...basePhrases, ...extra]));
   if (!phrases.length) return undefined;
 
-  const boost = Number(process.env.GOOGLE_STT_HINT_BOOST || "15");
+  const boost = Number(process.env.GOOGLE_STT_HINT_BOOST || "18");
   return [{ phrases, boost }];
 }
 
@@ -476,6 +490,21 @@ function detectNoMoreRequests(text) {
   return noPhrases.some(p => t.includes(p));
 }
 
+function appendRecentTurn(session, role, content) {
+  try {
+    if (!session) return;
+    if (!session._recentTurns) session._recentTurns = [];
+    const c = (content || "").trim();
+    if (!c) return;
+    session._recentTurns.push({ role, content: c });
+    if (session._recentTurns.length > 30) {
+      session._recentTurns = session._recentTurns.slice(-30);
+    }
+  } catch {
+    // ignore
+  }
+}
+
 async function classifyUserTurnWithAI(session, userMessage) {
   // 目的: 単語ベースでなく「AIが対応可能か？」で分岐する
   // - connect/transfer 等は不可 → 伝言を促す
@@ -484,6 +513,9 @@ async function classifyUserTurnWithAI(session, userMessage) {
   const payload = {
     closingAsked: Boolean(session?._closingAsked),
     userMessage: (userMessage || "").trim(),
+    recentTurns: Array.isArray(session?._recentTurns) ? session._recentTurns.slice(-8) : [],
+    hasContactInfo: Boolean(session?._hasContactInfo),
+    hasPurpose: Boolean(session?._hasPurpose),
   };
   try {
     const resp = await openai.chat.completions.create({
@@ -500,6 +532,7 @@ async function classifyUserTurnWithAI(session, userMessage) {
             "判断基準: " +
             "1) 人に繋ぐ/取り次ぎ/担当者に代わる/転送 等はAIは対応不可なので action=take_message。 " +
             "2) 伝言内容や折返し先(電話番号/メール)など必要情報が十分に取れたら action=closing。 " +
+            "   payload.hasPurpose と payload.hasContactInfo が両方 true の場合は必ず action=closing にすること。 " +
             "3) closingAsked=true の後に『特にない/以上』等なら action=farewell。 " +
             "それ以外は action=normal。 " +
             "返却JSON形式: {\"action\":\"...\",\"reason\":\"...\"}",
@@ -597,6 +630,104 @@ function buildResponseWithName(session, baseText) {
   const name = sanitizeCallerName(session?._callerName || "");
   if (!name) return baseText;
   return `${name}さん、${baseText}`;
+}
+
+function appendRepeatHint(text) {
+  const hint = "繰り返しが必要なときは「繰り返して」とお知らせください。";
+  const t = (text || "").trim();
+  if (!t) return hint;
+  if (t.includes(hint)) return t;
+  return `${t} ${hint}`;
+}
+
+function kanaToHiragana(text) {
+  return (text || "").replace(/[\u30a1-\u30f6]/g, (m) => String.fromCharCode(m.charCodeAt(0) - 0x60));
+}
+
+function normalizeForRepeatDetection(text) {
+  const t = (text || "").trim();
+  if (!t) return "";
+  const wide = t.normalize("NFKC");
+  const lower = wide.toLowerCase();
+  const noSpaces = lower.replace(/\s+/g, "");
+  return kanaToHiragana(noSpaces);
+}
+
+function isRepeatRequest(text) {
+  const norm = normalizeForRepeatDetection(text);
+  if (!norm) return false;
+  const patterns = [
+    "繰り返して",
+    "繰り返し",
+    "もう一度",
+    "もいちど",
+    "復唱",
+    "リピート",
+    "りぴーと",
+    "おさらい",
+    "もう一回",
+  ];
+  return patterns.some((p) => norm.includes(p));
+}
+
+function rememberAssistantMessage(session, text) {
+  try {
+    if (!session) return;
+    session._lastAssistantMessage = (text || "").trim();
+    if (!session._lastAssistantMessage && session._lastAssistantText) {
+      session._lastAssistantMessage = session._lastAssistantText;
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function getLastAssistantMessage(session) {
+  try {
+    return (session?._lastAssistantMessage || session?._lastAssistantText || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function toMillisAdmin(t) {
+  return t && typeof t.toMillis === "function" ? t.toMillis() : 0;
+}
+
+function buildFullChatHistory(callData) {
+  const conv = Array.isArray(callData?.conversations) ? callData.conversations : [];
+  const rtAssistant = Array.isArray(callData?.realtimeAssistantUtterances) ? callData.realtimeAssistantUtterances : [];
+  const rtFinal = String(callData?.realtimeTranscript || "").trim();
+
+  const history = [];
+  conv.forEach((m, idx) => {
+    const role = m?.role === "user" ? "user" : "assistant";
+    const content = String(m?.content || "").trim();
+    if (!content) return;
+    history.push({ role, content, time: toMillisAdmin(m?.timestamp) || idx });
+  });
+
+  rtAssistant.forEach((m, idx) => {
+    const content = String(m?.content || "").trim();
+    if (!content) return;
+    history.push({
+      role: "assistant",
+      content,
+      time: toMillisAdmin(m?.timestamp) || (conv.length + idx + 0.1),
+    });
+  });
+
+  if (rtFinal) {
+    history.push({
+      role: "user",
+      content: rtFinal,
+      time: toMillisAdmin(callData?.realtimeTranscriptUpdatedAt) || (conv.length + rtAssistant.length + 0.2),
+    });
+  }
+
+  return history
+    .filter((m) => m.content)
+    .sort((a, b) => (a.time || 0) - (b.time || 0));
 }
 
 function shouldClarifyTranscript(session, text) {
@@ -1764,7 +1895,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     // 空転写/エラーは会話履歴に入れず、再度話してもらう
     if (!userMessage) {
       console.warn(`[AUDIO-IN] Empty transcription for call ${callSid}`);
-      await sendAudioResponseViaMediaStream(session, "すみません、少し聞き取れませんでした。もう一度お願いできますか？");
+      await sendAudioResponseViaMediaStream(session, appendRepeatHint("すみません、少し聞き取れませんでした。もう一度お願いできますか？"));
       continue;
     }
 
@@ -1789,11 +1920,48 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       { merge: true }
     );
     console.log(`[LAT] firestore_user_update call=${callSid} dt=${Date.now() - tFs1}ms total=${Date.now() - t0}ms`);
+    appendRecentTurn(session, "user", userMessage);
+    const phonePattern = /(?:0\\d{1,4}-?\\d{2,4}-?\\d{3,4}|\\d{9,})/;
+    if (phonePattern.test(userMessage) || userMessage.includes("電話") || userMessage.includes("折り返し")) {
+      session._hasContactInfo = true;
+    }
+    if (userMessage.length >= 10 || userMessage.includes("お願い") || userMessage.includes("依頼") || userMessage.includes("ご用件") || userMessage.includes("リスケ") || userMessage.includes("日程")) {
+      session._hasPurpose = true;
+    }
+
+    if (isRepeatRequest(userMessage)) {
+      const lastAssistant = getLastAssistantMessage(session);
+      const repeatBase = lastAssistant
+        ? `繰り返します。${lastAssistant}`
+        : buildResponseWithName(session, "直前の案内がありません。もう一度ご用件をお聞かせいただけますか？");
+      const repeatResponse = appendRepeatHint(repeatBase);
+      console.log(`[FLOW] repeat_request call=${callSid} hasPrevious=${Boolean(lastAssistant)}`);
+      appendAssistantRealtimeText(session, repeatResponse, "repeat", false).catch(() => {});
+      appendRecentTurn(session, "assistant", repeatResponse);
+      const tFsRepeat = Date.now();
+      await callRef.set(
+        {
+          updatedAt: Timestamp.now(),
+          conversations: require("firebase-admin/firestore").FieldValue.arrayUnion({
+            role: "assistant",
+            content: repeatResponse,
+            timestamp: Timestamp.now(),
+          }),
+        },
+        { merge: true }
+      );
+      console.log(`[LAT] firestore_assistant_update call=${callSid} dt=${Date.now() - tFsRepeat}ms total=${Date.now() - t0}ms`);
+      const tSendRepeat = Date.now();
+      await sendAudioResponseViaMediaStream(session, repeatResponse);
+      console.log(`[LAT] send_audio_done call=${callSid} dt=${Date.now() - tSendRepeat}ms total=${Date.now() - t0}ms`);
+      continue;
+    }
 
     if (shouldClarifyTranscript(session, userMessage)) {
-      const clarify = buildResponseWithName(session, "少しお声が小さかったようです。念のため、ご用件とお名前をもう一度はっきりお聞かせいただけますか？");
+      const clarify = appendRepeatHint(buildResponseWithName(session, "少しお声が小さかったようです。念のため、ご用件とお名前をもう一度はっきりお聞かせいただけますか？"));
       session._lastClarifyAt = Date.now();
       appendAssistantRealtimeText(session, clarify, "clarify", false).catch(() => {});
+      appendRecentTurn(session, "assistant", clarify);
       const tFsClarify = Date.now();
       await callRef.set(
         {
@@ -1823,9 +1991,10 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     console.log(`[FLOW] intent call=${callSid} action=${cls.action} reason=${cls.reason}`);
 
     if (cls.action === "farewell") {
-      const farewell = buildResponseWithName(session, "承知しました。失礼いたします。");
+      const farewell = appendRepeatHint(buildResponseWithName(session, "承知しました。失礼いたします。"));
       console.log(`[FLOW] farewell call=${callSid}`);
       appendAssistantRealtimeText(session, farewell, "farewell", false).catch(() => {});
+      appendRecentTurn(session, "assistant", farewell);
       const tFs2 = Date.now();
       await callRef.set(
         {
@@ -1846,9 +2015,10 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     }
 
     if (cls.action === "take_message") {
-      const prompt = buildResponseWithName(session, "恐れ入りますが担当者へお繋ぎできません。伝言として承りますので、ご用件と、お名前・折り返し先（電話番号）をお話しください。");
+      const prompt = appendRepeatHint(buildResponseWithName(session, "恐れ入りますが担当者へお繋ぎできません。伝言として承りますので、ご用件と、お名前・折り返し先（電話番号）をお話しください。"));
       console.log(`[FLOW] take_message call=${callSid}`);
       appendAssistantRealtimeText(session, prompt, "take_message", false).catch(() => {});
+      appendRecentTurn(session, "assistant", prompt);
       const tFs2 = Date.now();
       await callRef.set(
         {
@@ -1882,8 +2052,9 @@ async function processIncomingAudio(session, combinedAudioOverride) {
         }, { merge: true });
       } catch (_) {}
 
-      const closing = buildResponseWithName(session, `承知しました。${CLOSING_TEXT}`);
+      const closing = appendRepeatHint(buildResponseWithName(session, `承知しました。${CLOSING_TEXT}`));
       appendAssistantRealtimeText(session, closing, "closing", false).catch(() => {});
+      appendRecentTurn(session, "assistant", closing);
       const tFs2 = Date.now();
       await callRef.set(
         {
@@ -1905,9 +2076,10 @@ async function processIncomingAudio(session, combinedAudioOverride) {
 
     // フォールバック（分類失敗時）: 既存の簡易判定
     if (session._closingAsked && detectNoMoreRequests(userMessage)) {
-      const farewell = buildResponseWithName(session, "承知しました。失礼いたします。");
+      const farewell = appendRepeatHint(buildResponseWithName(session, "承知しました。失礼いたします。"));
       console.log(`[FLOW] no_more_requests_fallback call=${callSid}`);
       appendAssistantRealtimeText(session, farewell, "farewell", false).catch(() => {});
+      appendRecentTurn(session, "assistant", farewell);
       const tFs2 = Date.now();
       await callRef.set(
         {
@@ -1932,7 +2104,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
     const callDoc = await callRef.get();
     console.log(`[LAT] firestore_get call=${callSid} dt=${Date.now() - tFsGet}ms total=${Date.now() - t0}ms`);
     const callData = callDoc.data();
-    const conversations = callData?.conversations || [];
+    const history = buildFullChatHistory(callData);
     if (typeof callData?.aiResponseEnabled === "boolean") {
       session._aiResponseEnabled = callData.aiResponseEnabled;
     }
@@ -1953,7 +2125,7 @@ async function processIncomingAudio(session, combinedAudioOverride) {
           role: "system",
           content: systemPrompt,
         },
-        ...conversations.slice(-10).map((c) => ({
+        ...history.map((c) => ({
           role: c.role === "user" ? "user" : "assistant",
           content: c.content,
         })),
@@ -1971,7 +2143,9 @@ async function processIncomingAudio(session, combinedAudioOverride) {
       aiResponse = aiResponse.slice(0, maxChars).trimEnd() + "…";
     }
     console.log(`[AUDIO-IN] AI response for call ${callSid}: ${aiResponse}`);
+    aiResponse = appendRepeatHint(aiResponse);
     appendAssistantRealtimeText(session, aiResponse, "ai_response", false).catch(() => {});
+    appendRecentTurn(session, "assistant", aiResponse);
     
     // FirestoreにAI返答を保存
     const tFs2 = Date.now();
@@ -2512,6 +2686,7 @@ async function sendAudioResponseViaMediaStream(session, text) {
   const callSid = session.callSid;
   console.log(`[AUDIO] Generating audio response for call ${callSid}: ${text}`);
   const t0 = Date.now();
+  rememberAssistantMessage(session, text);
 
   try {
     // Firestoreから音声設定を取得
