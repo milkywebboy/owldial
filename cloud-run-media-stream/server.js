@@ -192,12 +192,26 @@ function getGoogleSttSpeechContexts() {
     // 典型的な誤認識（例: 「お世話」→「朝」）を抑えるための汎用フレーズ
     "お世話になっております",
     "お世話になっております。", // punctuation付きも入れておく
+    "お世話になっております、テックファンドです",
+    "お電話ありがとうございます。テックファンドです。",
     "恐れ入ります",
     "失礼いたします",
     "承知しました",
     "伝言",
     "折り返し",
     "担当者",
+    "要件を繰り返していただけますか",
+    "要件を繰り返して",
+    "もう一度お聞かせください",
+    "もう一度お願いします",
+    "請求書の内容についてお伺いしたくお電話しました",
+    "請求書についてお伺いしたくお電話しました",
+    "請求書の内容について",
+    "請求書について",
+    "開発定例",
+    "リスケ",
+    "折り返し先は私木下宛てです",
+    "折り返し先は私 木下宛てです",
   ];
   const raw = String(process.env.GOOGLE_STT_HINTS || "").trim();
   const extra = raw
@@ -207,7 +221,7 @@ function getGoogleSttSpeechContexts() {
   const phrases = Array.from(new Set([...basePhrases, ...extra]));
   if (!phrases.length) return undefined;
 
-  const boost = Number(process.env.GOOGLE_STT_HINT_BOOST || "15");
+  const boost = Number(process.env.GOOGLE_STT_HINT_BOOST || "18");
   return [{ phrases, boost }];
 }
 
