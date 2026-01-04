@@ -135,6 +135,8 @@ export default function SimulateCall() {
   const outboundMulawRef = useRef<Uint8Array[]>([]);
   const [outWavUrl, setOutWavUrl] = useState<string | null>(null);
   const [outMulawUrl, setOutMulawUrl] = useState<string | null>(null);
+  const userMulawRef = useRef<Uint8Array[]>([]);
+  const [userWavUrl, setUserWavUrl] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const captureCtxRef = useRef<AudioContext | null>(null);
@@ -560,6 +562,7 @@ export default function SimulateCall() {
     setOutboundBytes(0);
     setOutboundChunks(0);
     outboundMulawRef.current = [];
+    userMulawRef.current = [];
     sendQueueRef.current = new Uint8Array(0);
     resampleRef.current = { buf: new Float32Array(0), pos: 0 };
     playbackStateRef.current = { buf: new Float32Array(0), pos: 0 };
@@ -576,6 +579,8 @@ export default function SimulateCall() {
     if (outMulawUrl) URL.revokeObjectURL(outMulawUrl);
     setOutWavUrl(null);
     setOutMulawUrl(null);
+    if (userWavUrl) URL.revokeObjectURL(userWavUrl);
+    setUserWavUrl(null);
 
     try {
       const constraints: MediaStreamConstraints = {
@@ -669,6 +674,7 @@ export default function SimulateCall() {
           if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
           const chunk = takeFromSendQueue(chunkBytes);
           if (!chunk) return;
+          userMulawRef.current.push(chunk);
           wsRef.current.send(
             JSON.stringify({
               event: "media",
@@ -721,6 +727,17 @@ export default function SimulateCall() {
         // ignore
       }
       captureCtxRef.current = null;
+    }
+    try {
+      const mergedMulaw = mergeChunks(userMulawRef.current);
+      if (mergedMulaw.length) {
+        const pcm = muLawToPcm16(mergedMulaw);
+        const wavBlob = pcm16ToWavBlob(pcm, 8000);
+        const url = URL.createObjectURL(wavBlob);
+        setUserWavUrl(url);
+      }
+    } catch {
+      // ignore
     }
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       try {
@@ -1008,6 +1025,11 @@ export default function SimulateCall() {
                 <a className="simLink" href={outWavUrl} download={`outbound-${callSid}.wav`}>
                   WAVを保存
                 </a>
+                {userWavUrl ? (
+                  <a className="simLink" href={userWavUrl} download={`user-${callSid}.wav`}>
+                    ユーザー音声(WAV)
+                  </a>
+                ) : null}
                 {outMulawUrl ? (
                   <a className="simLink" href={outMulawUrl} download={`outbound-${callSid}.ulaw`}>
                     μ-law(raw)を保存
