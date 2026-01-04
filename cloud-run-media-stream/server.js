@@ -235,6 +235,8 @@ async function transcribeWithGoogleSpeechMulaw(callSid, mulawBuffer) {
     config: {
       encoding: "MULAW",
       sampleRateHertz: 8000,
+      audioChannelCount: 1,
+      enableSeparateRecognitionPerChannel: false,
       languageCode: "ja-JP",
       enableAutomaticPunctuation: true,
       // 電話音声向け（利用できない場合はAPI側で無視/エラーになる可能性があるのでtry/catchで吸収）
@@ -265,6 +267,8 @@ async function transcribeWithGoogleSpeechMulaw(callSid, mulawBuffer) {
       config: {
         encoding: "MULAW",
         sampleRateHertz: 8000,
+        audioChannelCount: 1,
+        enableSeparateRecognitionPerChannel: false,
         languageCode: "ja-JP",
         enableAutomaticPunctuation: true,
       },
@@ -404,6 +408,8 @@ function startRealtimeGoogleSttIfNeeded(session) {
       config: {
         encoding: "MULAW",
         sampleRateHertz: 8000,
+        audioChannelCount: 1,
+        enableSeparateRecognitionPerChannel: false,
         languageCode: "ja-JP",
         enableAutomaticPunctuation: true,
         interimResults: true,
