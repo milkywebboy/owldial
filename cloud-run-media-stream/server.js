@@ -1566,6 +1566,41 @@ function muLawToLinearSample(muLawByte) {
   return sign * (magnitude - 0x84);
 }
 
+function mulawBufferToPcm16(mulawBuffer) {
+  const pcm = new Int16Array(mulawBuffer.length);
+  for (let i = 0; i < mulawBuffer.length; i++) {
+    pcm[i] = muLawToLinearSample(mulawBuffer[i]);
+  }
+  return pcm;
+}
+
+function pcm16ToWavBuffer(pcm, sampleRate = 8000) {
+  const dataBytes = pcm.length * 2;
+  const buffer = Buffer.alloc(44 + dataBytes);
+  buffer.write("RIFF", 0);
+  buffer.writeUInt32LE(36 + dataBytes, 4);
+  buffer.write("WAVE", 8);
+  buffer.write("fmt ", 12);
+  buffer.writeUInt32LE(16, 16); // PCM header size
+  buffer.writeUInt16LE(1, 20); // PCM format
+  buffer.writeUInt16LE(1, 22); // channels
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * 2, 28); // byte rate
+  buffer.writeUInt16LE(2, 32); // block align
+  buffer.writeUInt16LE(16, 34); // bits per sample
+  buffer.write("data", 36);
+  buffer.writeUInt32LE(dataBytes, 40);
+  for (let i = 0; i < pcm.length; i++) {
+    buffer.writeInt16LE(pcm[i], 44 + i * 2);
+  }
+  return buffer;
+}
+
+function mulawToWavBuffer(mulawBuffer) {
+  const pcm = mulawBufferToPcm16(mulawBuffer);
+  return pcm16ToWavBuffer(pcm, 8000);
+}
+
 // MP3音声をmu-law形式（8000Hz、モノラル）に変換
 async function convertMp3ToMulaw(mp3Buffer) {
   const timestamp = Date.now();
@@ -1809,6 +1844,24 @@ async function saveRecordingBuffers(session) {
     if (outboundBuf && outboundBuf.length > 0) {
       const f = bucket.file(`recordings/${session.callSid}/outbound.ulaw`);
       tasks.push(f.save(outboundBuf, { contentType: "audio/basic" }));
+    }
+    if (inboundBuf && inboundBuf.length > 0) {
+      try {
+        const wav = mulawToWavBuffer(inboundBuf);
+        const f = bucket.file(`recordings/${session.callSid}/inbound.wav`);
+        tasks.push(f.save(wav, { contentType: "audio/wav" }));
+      } catch (e) {
+        console.warn(`[REC] inbound_wav_failed call=${session.callSid} err=${e.message}`);
+      }
+    }
+    if (outboundBuf && outboundBuf.length > 0) {
+      try {
+        const wav = mulawToWavBuffer(outboundBuf);
+        const f = bucket.file(`recordings/${session.callSid}/outbound.wav`);
+        tasks.push(f.save(wav, { contentType: "audio/wav" }));
+      } catch (e) {
+        console.warn(`[REC] outbound_wav_failed call=${session.callSid} err=${e.message}`);
+      }
     }
     if (tasks.length) {
       await Promise.all(tasks);
@@ -2812,6 +2865,44 @@ app.use(express.json());
 // ヘルスチェックエンドポイント
 app.get("/health", (req, res) => {
   res.status(200).send("OK");
+});
+
+// 録音（μ-law/WAV）ダウンロード
+app.get("/recordings/:callSid/:direction.wav", async (req, res) => {
+  try {
+    const callSid = String(req.params?.callSid || "").trim();
+    const dir = String(req.params?.direction || "").trim();
+    if (!callSid || (dir !== "inbound" && dir !== "outbound")) {
+      return res.status(400).json({ error: "invalid parameters" });
+    }
+
+    let mulaw = null;
+    const session = activeSessions.get(callSid);
+    if (session) {
+      const arr = dir === "inbound" ? session._recordInbound : session._recordOutbound;
+      if (Array.isArray(arr) && arr.length) {
+        mulaw = Buffer.concat(arr);
+      }
+    }
+
+    if (!mulaw || !mulaw.length) {
+      if (!bucket) return res.status(404).json({ error: "recording not found" });
+      const path = `recordings/${callSid}/${dir}.ulaw`;
+      const file = bucket.file(path);
+      const [exists] = await file.exists();
+      if (!exists) return res.status(404).json({ error: "recording not found" });
+      const [data] = await file.download();
+      mulaw = data;
+    }
+
+    const wav = mulawToWavBuffer(mulaw);
+    res.setHeader("Content-Type", "audio/wav");
+    res.setHeader("Content-Disposition", `attachment; filename="${dir}-${callSid}.wav"`);
+    res.send(wav);
+  } catch (e) {
+    console.error(`[REC] download_failed err=${e.message}`);
+    res.status(500).json({ error: "download failed", detail: e?.message || String(e) });
+  }
 });
 
 // 転送ボタン用: 案内音声を再生し、forwardedフラグをセット
