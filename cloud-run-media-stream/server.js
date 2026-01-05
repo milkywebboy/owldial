@@ -496,6 +496,25 @@ function detectNoMoreRequests(text) {
   return noPhrases.some(p => t.includes(p));
 }
 
+function guessNameFromText(text) {
+  try {
+    const s = String(text || "").replace(/\s+/g, "");
+    if (!s) return "";
+    // 例: 富士通の木下です -> 木下
+    const m1 = s.match(/の([^\p{P}\s。]+?)です/);
+    if (m1 && m1[1]) return sanitizeCallerName(m1[1]);
+    // 例: 木下と申します / 木下申します
+    const m2 = s.match(/([^\p{P}\s。]+?)(?:と)?申します/);
+    if (m2 && m2[1]) return sanitizeCallerName(m2[1]);
+    // 例: 木下です
+    const m3 = s.match(/([^\p{P}\s。]+?)です/);
+    if (m3 && m3[1]) return sanitizeCallerName(m3[1]);
+    return "";
+  } catch {
+    return "";
+  }
+}
+
 function buildTakeMessagePrompt(session) {
   const nameKnown = Boolean(sanitizeCallerName(session?._callerName || ""));
   const phoneKnown = Boolean(session?._hasContactInfo);
@@ -629,6 +648,21 @@ async function detectAndStoreCallerName(session, callRef, userMessage) {
   if (!session || !callRef) return session?._callerName || "";
   const currentName = sanitizeCallerName(session._callerName || "");
   if (!shouldAttemptNameDetection(userMessage, currentName)) return currentName;
+
+  const heuristic = guessNameFromText(userMessage);
+  if (heuristic) {
+    session._callerName = heuristic;
+    session._hasContactName = true;
+    try {
+      await callRef.set({
+        name: heuristic,
+        callerNameDetectedAt: Timestamp.now(),
+      }, { merge: true });
+    } catch (e) {
+      console.warn(`[NAME] persist_failed call=${session.callSid || "unknown"} err=${e.message}`);
+    }
+    return heuristic;
+  }
 
   const detectedRaw = await extractCallerNameFromMessage(userMessage, currentName);
   const detected = sanitizeCallerName(detectedRaw);
@@ -2778,6 +2812,15 @@ async function sendAudioResponseViaMediaStream(session, text) {
     const speed = callData?.speed || 1.3;
 
     console.log(`[AUDIO] TTS settings for call ${callSid}: engine=${ttsEngine}, voice=${ttsVoice}, speed=${speed}`);
+    try {
+      await callDoc.ref.set({
+        lastTtsEngine: ttsEngine,
+        lastTtsVoice: ttsVoice,
+        lastTtsAt: Timestamp.now(),
+      }, { merge: true });
+    } catch (e) {
+      console.warn(`[AUDIO] tts_meta_persist_failed call=${callSid} err=${e.message}`);
+    }
 
     const ttsText = normalizeJapaneseTextForTts(text);
     if (ttsText !== text) {
