@@ -287,9 +287,10 @@ async function transcribeWithGoogleSpeechMulaw(callSid, mulawBuffer) {
 }
 
 function shouldEnableRealtimeStt() {
-  // googleを選んだらデフォルトON（止めたい場合は DISABLE_REALTIME_STT=true）
+  // realtime transcript はSTT本体のプロバイダに関係なく、Googleが使えるなら常時ON
+  // 止めたい場合は DISABLE_REALTIME_STT=true
   if (String(process.env.DISABLE_REALTIME_STT || "").toLowerCase() === "true") return false;
-  return getSttProvider() === "google";
+  return Boolean(speechClient);
 }
 
 function scheduleRealtimeTranscriptFlush(session) {
